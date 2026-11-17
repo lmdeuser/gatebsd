@@ -1,0 +1,33 @@
+SHELL=/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+
+# Complete FreeBSD 15.1 amd64 release/snapshot mirror.
+15 0 * * * root /usr/local/sbin/mirror-sync-freebsd-15-amd64 >> /var/log/freebsd-15-amd64-sync.log 2>&1
+
+# Atomic upstream refresh, HTTP publication and end-to-end verification.
+15 3 * * * root /usr/local/sbin/mirror-sync-git >> /var/log/freebsd-mirror-sync.log 2>&1 && /usr/local/sbin/mirror-publish-http >> /var/log/freebsd-mirror-sync.log 2>&1 && /usr/local/sbin/mirror-health-check >> /var/log/freebsd-mirror-health.log 2>&1 && /usr/local/sbin/mirror-status-update >> /var/log/freebsd-mirror-health.log 2>&1
+
+# Refresh public status even when no upstream synchronization is due.
+45 * * * * root /usr/local/sbin/mirror-health-check >> /var/log/freebsd-mirror-health.log 2>&1; /usr/local/sbin/mirror-status-update >> /var/log/freebsd-mirror-health.log 2>&1
+
+# Keep the stand's TLS leaf alive. step-ca issues it with a ~30 day lifetime and
+# nothing renewed it, so the pipeline died in July when it lapsed. The script is
+# a no-op until the certificate is inside its renewal window, and renewal
+# authenticates with the certificate being replaced -- so this must run daily
+# and well before expiry, not once a month.
+41 4 * * * root /usr/local/sbin/renew-stand-tls >> /var/log/stand-tls-renew.log 2>&1
+
+# /usr/local/sbin/update-freebsd-local-repo is deliberately absent from this
+# file. An earlier generation of it -- written by a heredoc in
+# ci/host/configure_freebsd_mirror.sh, into this same path -- scheduled that
+# rebuild at 04:15 and was the ENTIRE content of the deployed crontab, so
+# everything above was lost while it was in place.
+#
+# It is not restored here, and the omission is a decision rather than an
+# oversight: the rebuild starts with `poudriere ports -u`, which moves the
+# ports tree, so running it nightly would walk the appliance's toolchain
+# forward underneath a release that has already been built and shipped. This is
+# a delivery stand; the package set moves when someone decides it moves. Run it
+# by hand, or from the pipeline, when that is the intent:
+#
+#     sudo /usr/local/sbin/update-freebsd-local-repo

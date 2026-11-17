@@ -1,0 +1,7 @@
+# Blocklist refresh every six hours.
+#
+# Weekly was too rare for lists that move daily: a name added upstream on
+# Thursday would not reach the device until the following Wednesday. The
+# sources are a few megabytes and the update is atomic, with a shrink guard
+# and an automatic rollback if unbound refuses the result.
+0 */6 * * * root /usr/local/sbin/gatebsd-adblock-update.sh

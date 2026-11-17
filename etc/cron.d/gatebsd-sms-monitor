@@ -1,0 +1,7 @@
+# Read the backup operator's state out of SMS every five minutes.
+#
+# The root field is not optional: FreeBSD cron parses every file in this
+# directory and each entry needs its user, and the modem lives behind an
+# interface only root's view of the system can be trusted about
+# (security.bsd.see_other_uids=0).
+*/5 * * * * root /usr/local/sbin/gatebsd-sms-monitor

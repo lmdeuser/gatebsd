@@ -1,0 +1,16 @@
+#!/bin/sh
+# Move the stand's default route back to the wired leg (hn1) and load the
+# matching pf ruleset. Run by hand: this is the "the Wi-Fi leg is bad, go back
+# to the wire" half of a manual failover pair.
+#
+# Carried in the repository since 27 August 2026; it lived only on the stand
+# before that.
+
+set -eu
+
+/sbin/ifconfig hn1 up
+setfib 0 route delete default >/dev/null 2>&1 || true
+setfib 0 route delete -net 10.88.0.0/24 >/dev/null 2>&1 || true
+setfib 0 route add -net 10.88.0.0/24 -iface hn1
+setfib 0 route add default 10.88.0.1
+/sbin/pfctl -f /etc/pf.hyperv-primary.conf

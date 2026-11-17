@@ -1,0 +1,36 @@
+# Packages the stand needs, and why each one is here.
+#
+# The same idea as deployment.manifest, for the other half of the machine.
+# That file made file placement reproducible; nothing did the same for
+# dependencies, so the stand's requirements lived only in whoever set it up.
+# smartmontools is what exposed the gap: the host keeps 215 GB of mirror, all
+# of Forgejo and the whole release tree on one mechanical disk, and could not
+# read that disk's health at all because nobody had noticed the package was
+# absent.
+#
+# install-ci-host.sh installs what is missing; verify-deployment.sh reports it
+# as drift. One source, read by both, so an installer that provides something
+# and a verifier that expects something else cannot disagree.
+#
+# This is a list of what the stand REQUIRES, not an inventory of what it has.
+# Adding a line is a statement that something here breaks without it.
+#
+# Columns: package name, then free text.
+
+# smartmontools and nut left this list on 14 August 2026, when the stand moved
+# off the physical N100 into a virtual machine.
+#
+# smartmontools was here because tank lived on one mechanical ada0 whose health
+# nothing could read. The VM's tank is a virtual disk: SMART belongs to the
+# hypervisor's host, and asking a guest for it returns nothing useful. nut read
+# UPS status over the network, and the UPS now backs the hypervisor host, not
+# the guest -- the guest is shut down by the host, which is what
+# AutomaticStopAction is for.
+#
+# Both are still real requirements of the appliance itself; this file is only
+# about the stand.
+rsync           mirror synchronisation
+sqlite3         the CI dashboard reads Forgejo's database
+git             checkouts for builds
+zstd            job logs are stored compressed
+ca_root_nss     TLS trust for fetching sources and lists

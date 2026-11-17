@@ -1,0 +1,247 @@
+#!/bin/sh
+# PROVIDE: ru_bypass
+# REQUIRE: NETWORKING gatebsd_lock_cleanup mpd5
+# KEYWORD: shutdown
+#
+# The net/mpd5 port provides "mpd5", not "mpd". An unsatisfiable requirement is
+# only a warning to rcorder(8) -- it still emits the file, silently dropping the
+# ordering constraint -- and /etc/rc discards both the warning and the exit
+# status. The former "mpd amnezia" therefore ordered nothing, so this could run
+# before PPPoE had negotiated and find no WAN gateway. There is no rc script
+# named "amnezia": the tunnel is brought up by gatewayctl_apply, which requires
+# this service rather than the other way round.
+
+. /etc/rc.subr
+
+name="ru_bypass"
+rcvar="ru_bypass_enable"
+desc="Apply GateBSD RU bypass routes without blocking system boot"
+pidfile="/var/run/gatebsd/ru-bypass-apply.pid"
+start_cmd="ru_bypass_start"
+stop_cmd="ru_bypass_stop"
+status_cmd="ru_bypass_status"
+extra_commands="clear check schedule-clear"
+clear_cmd="ru_bypass_clear"
+check_cmd="ru_bypass_check"
+schedule_clear_cmd="ru_bypass_schedule_clear"
+RU_ROUTES_HELPER=${GATEBSD_RU_ROUTES_HELPER:-/usr/local/sbin/ru-routes.sh}
+RU_TABLE=${RU_TABLE:-/usr/local/etc/amnezia/ru_bypass.table}
+RU_STATE_FILE=${RU_STATE_FILE:-/var/db/gatebsd-system/ru-routes.applied}
+STATE_READER=${GATEBSD_STATE_READER:-/usr/local/sbin/gatebsd-state-value}
+RU_BYPASS_SCRIPT=${GATEBSD_RU_BYPASS_SCRIPT:-${_file:-$0}}
+case "$RU_BYPASS_SCRIPT" in
+    *ru_bypass*) ;;
+    *) RU_BYPASS_SCRIPT=/usr/local/etc/rc.d/ru_bypass ;;
+esac
+
+_validate_timeouts() {
+    for _value in "$ru_bypass_apply_timeout" "$ru_bypass_stop_timeout"; do
+        case "$_value" in ''|*[!0-9]*) echo "Invalid ru_bypass timeout: $_value" >&2; return 1 ;; esac
+    done
+    [ "$ru_bypass_apply_timeout" -ge 30 ] && [ "$ru_bypass_apply_timeout" -le 3600 ] || {
+        echo "ru_bypass_apply_timeout must be between 30 and 3600 seconds" >&2
+        return 1
+    }
+    [ "$ru_bypass_stop_timeout" -ge 1 ] && [ "$ru_bypass_stop_timeout" -le 120 ] || {
+        echo "ru_bypass_stop_timeout must be between 1 and 120 seconds" >&2
+        return 1
+    }
+}
+
+_validate_runtime_paths() {
+    _run_dir=${pidfile%/*}
+    if [ -e "$_run_dir" ] || [ -L "$_run_dir" ]; then
+        [ -d "$_run_dir" ] && [ ! -L "$_run_dir" ] || {
+            echo "Unsafe GateBSD runtime directory: $_run_dir" >&2
+            return 1
+        }
+        _uid=$(stat -f '%u' "$_run_dir" 2>/dev/null || printf '%s' -1)
+        _mode=$(stat -f '%Lp' "$_run_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_uid" = 0 ] || { echo "GateBSD runtime directory must be root-owned" >&2; return 1; }
+        case "$_mode" in
+            *[2367][0-7]|*[0-7][2367]) echo "GateBSD runtime directory must not be group/world writable" >&2; return 1 ;;
+        esac
+    else
+        install -d -o root -g gatebsd -m 0750 "$_run_dir" || return 1
+    fi
+
+    if [ -e "$pidfile" ] || [ -L "$pidfile" ]; then
+        [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || {
+            echo "Unsafe RU bypass pidfile: $pidfile" >&2
+            return 1
+        }
+    fi
+}
+
+_valid_worker_pid() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ] 2>/dev/null || return 1
+    _command=$(ps -p "$1" -o command= 2>/dev/null || true)
+    case "$_command" in
+        *ru_bypass*__ru-worker*|*lockf*ru-routes.sh*apply*|*ru-routes.sh*apply*|*ru-routes.sh*clear*) kill -0 "$1" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+_read_worker_pid() {
+    [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || return 1
+    _pid=$(sed -n '1p' "$pidfile" 2>/dev/null | tr -d '[:space:]')
+    _valid_worker_pid "$_pid" || return 1
+    printf '%s\n' "$_pid"
+}
+
+_remove_stale_pidfile() {
+    # daemon(8) keeps its child pidfile locked for as long as its supervisor
+    # lives.  Removing it under lockf proves that no live supervisor still owns
+    # this pathname; a bounded retry absorbs the supervisor's asynchronous exit.
+    _wait=0
+    while [ "$_wait" -lt 20 ]; do
+        [ -e "$pidfile" ] || return 0
+        lockf -t 0 "$pidfile" /bin/rm -f "$pidfile" 2>/dev/null && return 0
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    echo "RU bypass pidfile is still locked by another process: $pidfile" >&2
+    return 1
+}
+
+# Signal the whole process group, not just the pidfile PID.  Verified on FreeBSD
+# 15.1: with `daemon -f -p` the supervisor is the process-group leader, so
+# TERM-ing only the child left the supervisor holding the pidfile lock -- the
+# next start then failed with "already locked" and RU bypass routes stayed
+# unapplied -- and left the worker's own children running.
+_worker_pgid() {
+    _pgid=$(ps -p "$1" -o pgid= 2>/dev/null | tr -d '[:space:]')
+    case "$_pgid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_pgid" -gt 1 ] || return 1
+    printf '%s\n' "$_pgid"
+}
+
+ru_bypass_check() {
+    "$RU_ROUTES_HELPER" check
+}
+
+_ru_worker_env() {
+    env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+        HOME=/root LANG=C.UTF-8 \
+        GATEBSD_RU_APPLY_TIMEOUT="$ru_bypass_apply_timeout" \
+        GATEBSD_ACTIVE_WAN_IF="${GATEBSD_ACTIVE_WAN_IF:-}" \
+        GATEBSD_ACTIVE_WAN_GW="${GATEBSD_ACTIVE_WAN_GW:-}" \
+        GATEBSD_STATE_READER="$STATE_READER" \
+        GATEBSD_RU_ROUTES_HELPER="$RU_ROUTES_HELPER" \
+        RU_TABLE="$RU_TABLE" RU_STATE_FILE="$RU_STATE_FILE" \
+        "$@"
+}
+
+ru_bypass_start() {
+    _validate_timeouts || return 1
+    _validate_runtime_paths || return 1
+
+    if _pid=$(_read_worker_pid); then
+        echo "RU bypass route application is already running as pid $_pid"
+        return 0
+    fi
+    _remove_stale_pidfile || return 1
+
+    # A service restart must not churn a route set that is already correct.
+    if ru_bypass_check >/dev/null 2>&1; then
+        echo "RU bypass routes are already active."
+        return 0
+    fi
+
+    echo "Scheduling RU bypass route application in the background..."
+    /usr/sbin/daemon -f -p "$pidfile" -o "$ru_bypass_log" \
+        /bin/sh "$RU_BYPASS_SCRIPT" __ru-worker apply || return 1
+
+    # Detect immediate launch failures without waiting for the route transaction.
+    _wait=0
+    while [ "$_wait" -lt 8 ]; do
+        _read_worker_pid >/dev/null 2>&1 && return 0
+        ru_bypass_check >/dev/null 2>&1 && return 0
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    echo "RU bypass worker did not start; see $ru_bypass_log" >&2
+    return 1
+}
+
+ru_bypass_schedule_clear() {
+    ru_bypass_stop || return 1
+    echo "Scheduling RU bypass route removal in the background..."
+    /usr/sbin/daemon -f -p "$pidfile" -o "$ru_bypass_log" \
+        /bin/sh "$RU_BYPASS_SCRIPT" __ru-worker clear || return 1
+    _wait=0
+    while [ "$_wait" -lt 8 ]; do
+        _read_worker_pid >/dev/null 2>&1 && return 0
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    echo "RU bypass clear worker did not start; see $ru_bypass_log" >&2
+    return 1
+}
+
+ru_bypass_stop() {
+    _validate_timeouts || return 1
+    _validate_runtime_paths || return 1
+    if ! _pid=$(_read_worker_pid); then
+        _remove_stale_pidfile || return 1
+        echo "No RU bypass route transaction is running; active routes are preserved."
+        return 0
+    fi
+
+    echo "Stopping the in-progress RU bypass transaction; active routes will be preserved..."
+    if _pgid=$(_worker_pgid "$_pid"); then
+        kill -TERM -"$_pgid" 2>/dev/null || true
+    else
+        kill -TERM "$_pid" 2>/dev/null || true
+    fi
+    _wait=0
+    _limit=$((ru_bypass_stop_timeout * 4))
+    while [ "$_wait" -lt "$_limit" ]; do
+        if ! _valid_worker_pid "$_pid"; then
+            # Wait out daemon(8)'s asynchronous pidfile release so a following
+            # start does not collide with a supervisor that is already exiting.
+            _remove_stale_pidfile || true
+            return 0
+        fi
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+
+    # Do not use SIGKILL: lockf forwards TERM and the worker must complete its
+    # compensating rollback before it exits.
+    echo "RU bypass worker did not stop within ${ru_bypass_stop_timeout}s; it was left running to finish or roll back safely." >&2
+    return 1
+}
+
+ru_bypass_clear() {
+    ru_bypass_stop || return 1
+    echo "Explicitly clearing GateBSD-managed RU bypass routes..."
+    "$RU_ROUTES_HELPER" clear
+}
+
+ru_bypass_status() {
+    _validate_runtime_paths || return 1
+    if _pid=$(_read_worker_pid); then
+        echo "RU bypass route application is running as pid $_pid"
+        return 0
+    fi
+    if ru_bypass_check >/dev/null 2>&1; then
+        echo "RU bypass routes are active"
+        return 0
+    fi
+    echo "RU bypass routes are not fully active"
+    return 1
+}
+
+load_rc_config "$name"
+: ${ru_bypass_enable:="NO"}
+: ${ru_bypass_apply_timeout:="300"}
+: ${ru_bypass_stop_timeout:="20"}
+: ${ru_bypass_log:="/var/log/ru-bypass.log"}
+if [ "${1:-}" = __ru-worker ]; then
+    shift
+    _ru_worker_env "$RU_ROUTES_HELPER" "$@"
+    exit $?
+fi
+run_rc_command "$1"

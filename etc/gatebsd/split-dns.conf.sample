@@ -1,0 +1,6 @@
+# GateBSD targeted Split-DNS configuration.
+# Root zone "." continues resolving through the VPN tunnel upstream.
+# Only explicitly listed geo-sensitive RU domains forward to the upstreams below.
+upstreams 77.88.8.8 77.88.8.1
+# gosuslugi.ru
+# nalog.gov.ru

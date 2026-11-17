@@ -1,0 +1,23 @@
+# GateBSD — main gateway config
+# FreeBSD 15.1 / pf / mpd5-PPPoE / AmneziaWG
+
+WAN_IF="ng0"
+BACKUP_IF="ue0"
+LAN_IF="re1"
+VPN_IF="awg0"
+
+LAN_NET="10.88.0.0/24"
+
+AWG_CONFIG="/usr/local/etc/amnezia/awg0.conf"
+RU_TABLE="/usr/local/etc/amnezia/ru_bypass.table"
+
+VPN_ENDPOINT_HOST="vpn.example.invalid"
+VPN_ENDPOINT_PORT="51820"
+
+VPN_MTU="1280"
+TCP_MSS="1240"
+
+# Fallback: PPPoE peer IP if pppoe_gw() cannot read from ifconfig
+WAN_GW_FALLBACK="198.51.100.254"
+
+CHECK_IP="1.1.1.1"

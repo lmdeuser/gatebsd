@@ -1,0 +1,17 @@
+#!/bin/sh
+# PROVIDE: gatebsd_reverse_ssh
+# REQUIRE: NETWORKING gatebsd
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="gatebsd_reverse_ssh"
+rcvar="gatebsd_reverse_ssh_enable"
+desc="GateBSD reverse SSH port forwarding"
+: ${gatebsd_reverse_ssh_enable:=YES}
+start_cmd="/usr/local/sbin/gatebsd-reverse-ssh start"
+stop_cmd="/usr/local/sbin/gatebsd-reverse-ssh stop"
+status_cmd="/usr/local/sbin/gatebsd-reverse-ssh status"
+
+load_rc_config "$name"
+run_rc_command "$1"

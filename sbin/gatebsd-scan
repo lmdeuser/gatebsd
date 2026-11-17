@@ -1,0 +1,18 @@
+#!/bin/sh
+# Generate one bounded, atomic GateBSD discovery snapshot through the stable runtime.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+BACKEND=${GATEBSD_BACKEND:-/usr/local/share/gatebsd/webui/backend}
+OUT=${1:-/var/db/gatebsd/discovery.json}
+
+[ "$#" -le 1 ] || { echo "Usage: gatebsd-scan [/absolute/output.json]" >&2; exit 2; }
+case "$OUT" in /*) ;; *) echo "gatebsd-scan: output path must be absolute" >&2; exit 2 ;; esac
+[ -x "$PYTHON_LAUNCHER" ] && [ ! -L "$PYTHON_LAUNCHER" ] \
+    || { echo "gatebsd-scan: Python launcher is unavailable" >&2; exit 1; }
+[ -d "$BACKEND/gatebsd_ui" ] && [ ! -L "$BACKEND" ] \
+    || { echo "gatebsd-scan: backend is unavailable" >&2; exit 1; }
+
+exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 PYTHONPATH="$BACKEND" \
+    "$PYTHON_LAUNCHER" -m gatebsd_ui.discovery "$OUT"

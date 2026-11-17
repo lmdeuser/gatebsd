@@ -1,0 +1,30 @@
+# GateBSD watchdog configuration
+# Unified daemon: VPN health + WAN failover + RU bypass routes.
+FAILOVER_MODE="automatic"         # observe | automatic | manual
+PRIMARY_IF="ng0"
+BACKUP_IF="ue0"
+VPN_IF="awg0"
+CHECK_TARGETS="1.1.1.1 8.8.8.8 9.9.9.9"
+# Domestic RU probe targets tested only when gateway ping succeeds and every
+# global CHECK_TARGETS probe fails, distinguishing operator "white-list" mode
+# from a full uplink outage. Empty string disables this secondary probe.
+RU_CHECK_TARGETS="77.88.8.8"
+# Tried after ICMP echo has failed on every target. Carriers that drop echo to
+# public addresses are common on backup links; without this a usable backup
+# reads as dead and failover never fires. 0 disables the fallback.
+CHECK_TCP_PORT="443"
+CHECK_INTERVAL="10"
+PING_TIMEOUT="2"
+FAIL_THRESHOLD="3"
+RECOVERY_THRESHOLD="8"
+MIN_BACKUP_HOLD="120"
+SWITCH_COOLDOWN="60"
+# Per-link routing tables. Each WAN health check runs inside its own FIB so it
+# measures that link rather than whatever the system default happens to be
+# (here: the VPN). The watchdog populates these tables itself from ifconfig on
+# every tick; they require net.fibs > 2, which etc/sysctl.conf sets.
+PRIMARY_FIB="1"
+BACKUP_FIB="2"
+VPN_HANDSHAKE_MAX="120"           # seconds — rollback if stale
+VPN_RECOVERY_HANDSHAKE="60"       # seconds — re-apply if recovered
+EVENT_LOG="/var/log/gatebsd-watchdog.log"

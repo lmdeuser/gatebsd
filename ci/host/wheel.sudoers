@@ -1,0 +1,15 @@
+# The stand is operated through n100root.sh, which pipes a script over ssh and
+# runs it with `sudo -S`. That works only if wheel is allowed to sudo at all.
+#
+# On the physical N100 it was, and nobody wrote down where from. The VM built to
+# replace it was not, so on 15 August 2026 n100root.sh answered "operator is
+# not in the sudoers file" for every privileged check on the new stand -- while
+# n100.sh, which needs no privilege, worked. A stand that cannot be inspected as
+# root is a stand whose service status lies: security.bsd.see_other_uids hides
+# other users' processes from an unprivileged caller.
+#
+# A password is required on purpose. NOPASSWD here would give every wheel member
+# unattended root on the build host; the one automated caller that needs it,
+# ci_deployer, has its own drop-in beside this file and is limited to a single
+# command.
+%wheel ALL=(ALL:ALL) ALL

@@ -1,0 +1,92 @@
+#!/bin/sh
+# Conservative boot-time cleanup for stale GateBSD PID and kernel-lock files.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+RUN_DIR=${GATEBSD_RUN_DIR:-/var/run/gatebsd}
+MODE=${1:-}
+
+fail() { echo "gatebsd-lock-cleanup: $*" >&2; exit 1; }
+log() { logger -t gatebsd-lock-cleanup "$*" 2>/dev/null || true; printf '%s\n' "$*"; }
+
+[ "$MODE" = --boot ] || fail "usage: gatebsd-lock-cleanup --boot"
+[ "$(id -u)" -eq 0 ] || fail "root privileges are required"
+case "$RUN_DIR" in
+    /var/run/gatebsd) ;;
+    /*) [ "${GATEBSD_ALLOW_TEST_RUN_DIR:-0}" = 1 ] || fail "refusing non-standard run directory: $RUN_DIR" ;;
+    *) fail "run directory must be absolute" ;;
+esac
+
+if [ -e "$RUN_DIR" ] || [ -L "$RUN_DIR" ]; then
+    [ -d "$RUN_DIR" ] && [ ! -L "$RUN_DIR" ] || fail "unsafe run directory: $RUN_DIR"
+    _uid=$(stat -f '%u' "$RUN_DIR" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$RUN_DIR" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || fail "run directory is not root-owned: $RUN_DIR"
+    case "$_mode" in *[2367][0-7]|*[0-7][2367]) fail "run directory is group/world writable: $RUN_DIR" ;; esac
+else
+    install -d -o root -g gatebsd -m 0750 "$RUN_DIR"
+fi
+# Normalize a pre-existing secure directory so the gatebsd group can traverse
+# it for the agent socket while only root can create or remove entries.
+install -d -o root -g gatebsd -m 0750 "$RUN_DIR"
+
+valid_pid() {
+    _pid=$1
+    _pattern=$2
+    case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_pid" -gt 1 ] 2>/dev/null || return 1
+    _command=$(ps -p "$_pid" -o command= 2>/dev/null || true)
+    case "$_command" in *"$_pattern"*) kill -0 "$_pid" 2>/dev/null ;; *) return 1 ;; esac
+}
+
+cleanup_pidfile() {
+    _name=$1
+    _pattern=$2
+    _path="$RUN_DIR/$_name"
+    [ -e "$_path" ] || return 0
+    [ -f "$_path" ] && [ ! -L "$_path" ] || fail "unsafe pidfile: $_path"
+    _pid=$(sed -n '1p' "$_path" 2>/dev/null | tr -d '[:space:]')
+    if valid_pid "$_pid" "$_pattern"; then
+        fail "active GateBSD process found while boot cleanup is running: $_pattern pid=$_pid"
+    fi
+    rm -f "$_path"
+    log "removed stale pidfile $_path"
+}
+
+cleanup_pidfile agent.pid gatebsd_ui.agent
+cleanup_pidfile ui.pid gatebsd_ui.server
+cleanup_pidfile watchdog.pid gatebsd-watchdog.sh
+cleanup_pidfile ru-bypass-apply.pid ru-routes.sh
+# The daemon(8) supervisors that restart the three above. Left behind by a hard
+# power loss they would name PIDs the kernel has since handed to someone else,
+# and the stop paths read them to decide what to signal.
+cleanup_pidfile agent-supervisor.pid gatebsd-python
+cleanup_pidfile ui-supervisor.pid gatebsd-python
+cleanup_pidfile watchdog-supervisor.pid gatebsd-watchdog.sh
+
+cleanup_lock() {
+    _name=$1
+    _path="$RUN_DIR/$_name"
+    [ -e "$_path" ] || return 0
+    [ -f "$_path" ] && [ ! -L "$_path" ] || fail "unsafe lock path: $_path"
+    _uid=$(stat -f '%u' "$_path" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$_path" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || fail "lock file is not root-owned: $_path"
+    case "$_mode" in *[2367][0-7]|*[0-7][2367]) fail "lock file is group/world writable: $_path" ;; esac
+
+    # The cleanup service is ordered before NETWORKING and therefore before all
+    # GateBSD writers.  lockf still proves that no inherited holder exists.
+    if lockf -t 0 "$_path" /bin/rm -f "$_path"; then
+        log "removed unlocked boot-stale lock $_path"
+    else
+        fail "lock is still held during boot cleanup: $_path"
+    fi
+}
+
+for _lock in \
+    failoverctl.lock gatewayctl.lock image-backup.lock install.lock \
+    internet-recovery.lock pkg-update.lock ru-bypass-update.lock \
+    ru-routes.lock upgrade.lock ups-test.lock watchdog.lock
+do
+    cleanup_lock "$_lock"
+done

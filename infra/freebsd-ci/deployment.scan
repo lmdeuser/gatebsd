@@ -1,0 +1,92 @@
+# Where the stand is expected to account for every file, and what in those
+# places is knowingly not accounted for.
+#
+# deployment.manifest says what this repository puts on the stand.  It cannot
+# say anything about what is on the stand that the repository never put there,
+# and until this file existed nothing could: verify-deployment.sh only ever
+# noticed an unmanaged command because a cron file scheduled it.  A script that
+# merely sits in a PATH directory was scheduled by nothing, named by nothing,
+# and therefore reported by nothing.
+#
+# That is not hypothetical.  /usr/local/sbin/configure-freebsd-mirror was a
+# July copy of ci/host/configure_freebsd_mirror.sh which still carried the
+# set_conf() awk writer of /usr/local/etc/poudriere.conf that 1ea48bd had just
+# removed from the repository -- a second writer of a managed file, sitting in
+# root's PATH under a name that invites running it, in no manifest and no cron
+# file.  It was found by listing the directory by hand.
+#
+# Columns: keyword, path, then free text.
+#
+#   scan   walk this directory and account for every file under it
+#   state  a path inside a scanned directory that a daemon writes at runtime;
+#          no deployment ever places it, so it is not drift
+#   gap    a file we know nothing accounts for, and have decided to leave;
+#          reported as KNOWN GAP rather than UNACCOUNTED, and leftovers beside
+#          it are retired as if it were managed
+#
+# A file under a scanned directory is accounted for when a manifest row claims
+# it, or when pkg(8) owns it, or when pkg(8) owns the copy the port actually
+# installs -- FreeBSD ports ship editable configuration as `.sample`, `-dist`,
+# `.dist` or `.default` and let the first install copy it into place, so the
+# live file has no package behind it while the port plainly does.  Without that
+# rule /usr/local/etc reports two hundred findings nobody can act on and the
+# five that matter are lost in them.
+
+scan   /usr/local/sbin                  every command root's PATH offers
+scan   /usr/local/libexec               what the CI dispatcher and rc scripts exec
+scan   /usr/local/etc                   configuration, rc.d and cron.d
+scan   /usr/local/share/gatebsd/ports-overlay   local ports overlay (retired ports stay visible to drift checks)
+
+# Runtime state.  Each of these is a directory a daemon owns and rewrites; a
+# deployment has never placed a file in one, and never should.  Excluding them
+# by name here is deliberate and narrow -- the alternative, not scanning
+# /usr/local/etc at all, is what let the nginx site configuration collect
+# twenty-two dated copies unnoticed.
+state  /usr/local/etc/ssl               keys and certificates, generated, never in git
+state  /usr/local/etc/step              step-ca's config, database and secrets
+state  /usr/local/etc/poudriere.d/jails poudriere's own record of each build jail
+state  /usr/local/etc/poudriere.d/ports poudriere's own record of each ports tree
+state  /usr/local/etc/libvirt/bhyve     libvirt domain definitions
+state  /usr/local/etc/libvirt/qemu      libvirt network definitions
+state  /usr/local/etc/libvirt/storage   libvirt storage pool definitions
+state  /usr/local/etc/sasldb2.db        the SASL account database
+
+# Known gaps.  Every one of these is a decision, not an oversight, and every
+# one is still reported on each run -- the point of naming them here is that
+# the operator can tell a decided line from a new one, not that the line goes
+# away.  A gap that stops being printed stops being remembered.
+
+# mirror-sync-git was a gap here until 27 August 2026, on the grounds that
+# importing 8.6 KB nobody had re-derived would put a fiction in the repository.
+# The reasoning held right up to the moment the unread script turned out to
+# keep every previous copy of every mirrored repository forever -- 180 GB of
+# them -- and fill the pool, which stopped the release mirror for four days.
+# It is read, understood and carried now: infra/freebsd-ci/mirror-sync-git.sh.
+
+# nginx's two site files are assembled, not deployed. install-mirror-index.sh,
+# install-full-mirror-route.sh, install-poudriere-repo-route.sh,
+# install-poudriere-web-route.sh, install-gatebsd-release-route.sh and
+# install-ci-dashboard.sh each edit a section of them in place, so no single
+# repository file is their source and a manifest row would report drift on
+# every run. Naming them here is what makes the twenty-two dated copies beside
+# them leftovers rather than strangers.
+gap    /usr/local/etc/nginx/conf.d/freebsd-mirror.conf
+gap    /usr/local/etc/nginx/conf.d/forgejo.conf
+
+# Site-local, and deliberately not shipped. The operator's own sudo grant and
+# the stand's Samba share are properties of this one machine in this one room;
+# a repository that carries a customer appliance has no business shipping
+# either, and `operator ALL=(ALL) NOPASSWD: ALL` least of all.
+gap    /usr/local/etc/sudoers.d/operator
+gap    /usr/local/etc/smb4.conf
+
+# Hand-written because the ports ship nothing to copy: net-snmp and nut both
+# install a log file and no newsyslog fragment for it. Small, stable, and about
+# this host's disk rather than the product.
+gap    /usr/local/etc/newsyslog.conf.d/net-snmp.conf
+gap    /usr/local/etc/newsyslog.conf.d/nut.conf
+gap    /usr/local/etc/syslog.d/nut
+
+# The console locale for the desktop session on the stand. Not part of the
+# appliance, and the stand is the only machine that has a desktop at all.
+gap    /usr/local/etc/fish/conf.d/locale.fish

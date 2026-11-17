@@ -1,0 +1,626 @@
+#!/bin/sh
+set -euf
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+# The fixed PATH is what keeps this root-only builder from being pointed at
+# somebody else's daemon(8) or lockf(1). The detach harness has to substitute
+# both to *execute* the watcher/worker split rather than read it, so a prefix is
+# honoured when -- and only when -- the caller also sets GATEBSD_ALLOW_TEST_PATH.
+# Same gate, same reasoning as sbin/gatebsd-route-op.
+if [ "${GATEBSD_ALLOW_TEST_PATH:-0}" = 1 ] && [ -n "${GATEBSD_TEST_PATH_PREFIX:-}" ]; then
+    PATH="${GATEBSD_TEST_PATH_PREFIX}:${PATH}"
+fi
+export PATH
+
+LOCK=/var/run/gatebsd-ci-build.lock
+# Forgejo stores a repository under its OWNER's directory, and the owner here is
+# `operator`, not `gatebsd`.
+#
+# This was the third copy of that name in the tree. Commit 06091e0 (18 August
+# 2026) corrected the other two -- the workflow's `git remote add origin` and
+# REPO_SLUG in ci-dashboard-update.sh -- and missed this one. Nothing noticed
+# for nine days, because the publish job that reaches this line was being
+# skipped silently by the version gate the same commit had left broken. Two
+# defects hiding each other: the gate never ran the job, so the job's wrong
+# path never had a chance to fail.
+#
+# Derived from REPO_SLUG rather than spelled out again, so a fourth copy cannot
+# drift away from the other three.
+REPO_SLUG=${REPO_SLUG:-owner/gatebsd}
+REPOSITORY=${GATEBSD_FORGEJO_REPOSITORY:-/var/db/forgejo/forgejo-repositories/${REPO_SLUG%%/*}/${REPO_SLUG##*/}.git}
+# One stand serves more than one product, so the mirror tree is rooted at the
+# project slug rather than at this product's name spelled into every path.
+# The default is `gatebsd`, so every published path and URL stays byte for byte
+# what the devices already in the field are configured with: this parameterises
+# the root, it does not move it.
+# `-` and not `:-`: an explicitly empty PROJECT_SLUG means a caller computed
+# one and came back with nothing, and defaulting there would publish a second
+# product under this one's root. Only an unset variable asks for the default.
+PROJECT_SLUG=${PROJECT_SLUG-gatebsd}
+# The slug lands in filesystem paths, URLs and -- in the route installers -- an
+# nginx regex. Refusing anything but [a-z0-9-] up front is cheaper than making
+# each of those quote it correctly.
+case "$PROJECT_SLUG" in
+    ''|*[!a-z0-9-]*)
+        echo "PROJECT_SLUG must be non-empty and match [a-z0-9-]: $PROJECT_SLUG" >&2
+        exit 2 ;;
+esac
+# The CI base, not poudriere's build jail: the two were the same dataset until
+# 27 August, which quietly put the appliance's 73 packages inside every port
+# builder. See ci/host/prepare-gatebsd-build-jail.sh for what that cost.
+BASE_DATASET=tank/ci/base/freebsd_151_amd64
+BASE_SNAPSHOT=${BASE_DATASET}@gatebsd-ci-clean
+JAILS_DATASET=tank/ci/jails
+WORK_ROOT=/tank/ci/work
+LOG_ROOT=/tank/ci/logs
+ARTIFACT_ROOT=/tank/ci/artifacts
+# Releases live outside ARTIFACT_ROOT on purpose. /tank/ci/artifacts is a
+# build-indexed scratch area that prune_builds() reclaims, so the only copy of a
+# signed release used to be deleted after KEEP_BUILDS further pushes -- and its
+# URL contained a build ID nobody could derive without reading the job log.
+# RELEASE_ROOT is version-indexed, retained by version, and reachable at a
+# stable URL.
+RELEASE_ROOT=${RELEASE_ROOT:-/tank/${PROJECT_SLUG}/releases}
+SIGNING_KEY=/usr/local/etc/ssl/keys/pkg.key
+# Published builds retained. Each is a full ~300 KB package plus catalogue, and
+# nothing was reclaiming them, so /tank/ci grew without bound.
+KEEP_BUILDS=${KEEP_BUILDS:-10}
+case "$KEEP_BUILDS" in ''|*[!0-9]*) KEEP_BUILDS=10 ;; esac
+[ "$KEEP_BUILDS" -ge 1 ] || KEEP_BUILDS=10
+# Releases are far more valuable than builds and cost the same ~300 KB, so keep
+# a deeper history. This bounds growth without putting a recent release at risk.
+KEEP_RELEASES=${KEEP_RELEASES:-20}
+case "$KEEP_RELEASES" in ''|*[!0-9]*) KEEP_RELEASES=20 ;; esac
+[ "$KEEP_RELEASES" -ge 1 ] || KEEP_RELEASES=20
+
+# The build does not run in the caller's session, and that is the point.
+#
+# Run #44 built gatebsd-2.9.31 to completion -- package produced, verified,
+# installed into the jail -- and then the ssh session carrying the job from
+# ci-master to this host was reset. The process group got SIGHUP, the cleanup
+# trap below did what it is there for, and a finished build was discarded with
+# `result=FAILED`. Nothing was published. The transport is not ours to make
+# reliable; losing a completed build to it is.
+#
+# So the entry point computes the build id, starts the real build detached
+# through daemon(8), and then only *watches* its output. Killing the watcher
+# kills nothing: the build keeps running, publishes, and writes its result. A
+# re-run of the job sees the finished release.
+#
+# `supervise` never touches build state -- no jail, no dataset, no artifact --
+# so there is nothing for it to clean up and it installs no trap.
+supervise()
+{
+    _sha=$1
+    printf '%s' "$_sha" | grep -qE '^[0-9a-f]{40}$' || {
+        echo 'A full lowercase Git commit SHA is required.' >&2
+        exit 64
+    }
+    _build_id="$(date -u '+%Y%m%dT%H%M%SZ')-$(printf '%.12s' "$_sha")"
+    _log_dir="${LOG_ROOT}/${_build_id}"
+    _job_log="${_log_dir}/job.log"
+    _pid_file="${_log_dir}/worker.pid"
+
+    # Created here rather than left to the worker so the watcher knows where to
+    # look before the worker has started. Same owner and mode the worker would
+    # apply, so its own `install -d` is a no-op rather than a re-owning.
+    install -d -o root -g wheel -m 0750 "$LOG_ROOT" "$_log_dir"
+    : > "$_job_log"
+
+    # The worker inherits its build id instead of deriving a second one, which
+    # is what lets the watcher name the log before the worker exists.
+    GATEBSD_CI_BUILD_ID="$_build_id" \
+        daemon -f -p "$_pid_file" -o "$_job_log" \
+        lockf -t 0 "$LOCK" "$0" _locked "$_sha"
+
+    watch_build "$_log_dir" "$_pid_file"
+}
+
+# Stream the worker's output and end when the worker does. Two endings:
+# `result` appears (the worker reached its cleanup trap), or the worker is gone
+# without one -- which is what a failure before the trap is installed looks
+# like, and what `lockf` refusing a concurrent build looks like.
+watch_build()
+{
+    _dir=$1
+    _pidf=$2
+    _shown=0
+    _missing_pid_checks=0
+    while :; do
+        _lines=$(wc -l < "${_dir}/job.log" 2>/dev/null || echo 0)
+        if [ "$_lines" -gt "$_shown" ]; then
+            tail -n "+$((_shown + 1))" "${_dir}/job.log" | head -n "$((_lines - _shown))"
+            _shown=$_lines
+        fi
+        if [ -f "${_dir}/result" ]; then
+            # The worker writes `result` from its trap and exits immediately
+            # after; one more pass picks up whatever it printed on the way out.
+            sleep 1
+            _lines=$(wc -l < "${_dir}/job.log" 2>/dev/null || echo 0)
+            [ "$_lines" -le "$_shown" ] || tail -n "+$((_shown + 1))" "${_dir}/job.log"
+            grep -qx SUCCESS "${_dir}/result" && return 0
+            echo 'Build failed; see the job log above.' >&2
+            return 1
+        fi
+        if [ -s "$_pidf" ] && ! kill -0 "$(cat "$_pidf")" 2>/dev/null; then
+            # The worker being gone is NOT evidence that it recorded nothing.
+            # It writes `result` from its trap and exits in the next breath,
+            # so a pass that read the file before the write and the pid after
+            # the exit sees no result and a dead process -- and reports a
+            # finished build as a build that never answered. Under load the
+            # window is wide enough to hit: it took down a release gate.
+            #
+            # A dead worker only proves nothing MORE will arrive. Wait out the
+            # gap between the write and the exit, and look again. The cost is
+            # a few seconds on the genuinely-crashed path, which is rare and
+            # already fatal.
+            _grace=0
+            while [ "$_grace" -lt 5 ]; do
+                [ -f "${_dir}/result" ] && break
+                sleep 1
+                _grace=$((_grace + 1))
+            done
+            if [ -f "${_dir}/result" ]; then
+                continue
+            fi
+            echo 'The build exited without recording a result.' >&2
+            echo 'A build for another commit may already hold the lock.' >&2
+            return 1
+        fi
+        if [ ! -s "$_pidf" ]; then
+            # FreeBSD daemon(8) creates -p only after the child is alive.  If
+            # the child dies during its earliest validation (before the build
+            # cleanup trap can write result), there is no pid file to become
+            # stale.  The old watcher consequently slept forever; two such
+            # watchers survived for days after their workers had already
+            # printed "Forgejo GateBSD repository is missing." and exited.
+            # Give daemon startup several polling intervals, then fail loudly.
+            _missing_pid_checks=$((_missing_pid_checks + 1))
+            if [ "$_missing_pid_checks" -ge 5 ]; then
+                echo 'The build exited before creating its worker pid file.' >&2
+                echo 'See the job log above for the early validation error.' >&2
+                return 1
+            fi
+        else
+            _missing_pid_checks=0
+        fi
+        sleep 2
+    done
+}
+
+# --verify-only is a MODE of this command, not a second command, and that is
+# deliberate. ci_deployer.sudoers grants exactly one path -- the CI trust
+# boundary -- and release 2.9.90 died proving why a second helper is the wrong
+# shape: it had a manifest row, a dispatcher verb and a workflow step, and no
+# sudo grant. Making the check a mode leaves the boundary exactly where it was.
+#
+# Handled BEFORE the supervisor below, and not inside it: the check is quick
+# and synchronous, it takes no lock and builds nothing, and there is nothing
+# for a detached supervisor to watch.
+if [ "${1:-}" = "--verify-only" ]; then
+    [ "$#" -eq 2 ] || { echo 'usage: gatebsd-ci-build --verify-only COMMIT_SHA' >&2; exit 64; }
+    [ "$(id -u)" -eq 0 ] || { echo 'gatebsd-ci-build must run as root' >&2; exit 77; }
+    printf '%s' "$2" | grep -qE '^[0-9a-f]{40}$' || {
+        echo 'A full lowercase Git commit SHA is required.' >&2
+        exit 64
+    }
+    [ -d "$REPOSITORY" ] || { echo 'Forgejo GateBSD repository is missing.' >&2; exit 69; }
+# Does the stand still match the commit being built?
+#
+# The build host runs the scripts DEPLOYED on it, not the ones inside the commit
+# it is building: a fix to ci/host/ takes effect only once install-ci-host.sh
+# has run here. Release 2.9.88 died on exactly that -- the corrected path to the
+# Forgejo repository was in the commit, the machine was still executing the
+# previous copy, and the run failed on a line the tree said was already fixed.
+#
+# Asked against the commit rather than against whatever checkout sits in /root:
+# the tree comes straight out of the Forgejo repository and the verifier runs
+# FROM it. --drift-only because the stand carries two declared gaps in the nginx
+# site files; without it this would be red for ever and would guard nothing.
+    _work=$(mktemp -d) || { echo 'cannot create a work directory' >&2; exit 2; }
+    trap 'rm -rf "$_work"' EXIT HUP INT TERM
+    git --git-dir="$REPOSITORY" archive --format=tar "$2" | tar -xf - -C "$_work"
+    _verifier=${GATEBSD_VERIFY_DEPLOYMENT:-/usr/local/libexec/verify-deployment.sh}
+    [ -f "$_verifier" ] && [ ! -L "$_verifier" ] || {
+        echo "Trusted deployment verifier is missing: ${_verifier}" >&2
+        exit 69
+    }
+    [ -f "$_work/infra/freebsd-ci/deployment.manifest" ] || {
+        echo 'The commit carries no deployment.manifest.' >&2
+        exit 69
+    }
+    GATEBSD_REPO_DIR="$_work" \
+    GATEBSD_DEPLOY_MANIFEST="$_work/infra/freebsd-ci/deployment.manifest" \
+    GATEBSD_DEPLOY_PACKAGES="$_work/infra/freebsd-ci/packages.list" \
+    GATEBSD_DEPLOY_SCAN="$_work/infra/freebsd-ci/deployment.scan" \
+        sh "$_verifier" --drift-only
+    exit $?
+fi
+
+if [ "${1:-}" != _locked ]; then
+    [ "$#" -eq 1 ] || { echo 'usage: gatebsd-ci-build COMMIT_SHA' >&2; exit 64; }
+    [ "$(id -u)" -eq 0 ] || { echo 'gatebsd-ci-build must run as root' >&2; exit 77; }
+    supervise "$1"
+    exit $?
+fi
+shift
+
+[ "$(id -u)" -eq 0 ] || { echo 'gatebsd-ci-build must run as root' >&2; exit 77; }
+
+[ "$#" -eq 1 ] || exit 64
+COMMIT_SHA=$1
+printf '%s' "$COMMIT_SHA" | grep -qE '^[0-9a-f]{40}$' || {
+    echo 'A full lowercase Git commit SHA is required.' >&2
+    exit 64
+}
+
+[ -d "$REPOSITORY" ] || { echo 'Forgejo GateBSD repository is missing.' >&2; exit 69; }
+git --git-dir="$REPOSITORY" cat-file -e "${COMMIT_SHA}^{commit}"
+git --git-dir="$REPOSITORY" merge-base --is-ancestor "$COMMIT_SHA" refs/heads/master || {
+    echo 'Only commits reachable from refs/heads/master may produce release artifacts.' >&2
+    exit 77
+}
+zfs list -H "$BASE_SNAPSHOT" >/dev/null
+[ -r "$SIGNING_KEY" ] || { echo 'Package signing key is missing.' >&2; exit 69; }
+
+# Inherited from the watcher that started this worker, so both name the same
+# log directory -- the watcher has to know it before this process exists. It is
+# still validated here rather than trusted: every path below is built from it,
+# and this is the same shape `prune_builds` recognises.
+BUILD_ID=${GATEBSD_CI_BUILD_ID:-}
+printf '%s' "$BUILD_ID" | grep -qE '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$' || {
+    echo 'A build id of the form YYYYmmddTHHMMSSZ-<12 hex> is required.' >&2
+    exit 64
+}
+[ "$BUILD_ID" = "$(printf '%s' "$BUILD_ID" | sed "s/-.*//")-$(printf '%.12s' "$COMMIT_SHA")" ] || {
+    echo 'The build id does not name this commit.' >&2
+    exit 64
+}
+JAIL_NAME="gatebsd_${BUILD_ID}"
+CLONE_DATASET="${JAILS_DATASET}/${BUILD_ID}"
+JAIL_ROOT="${WORK_ROOT}/${BUILD_ID}/root"
+ARTIFACT_DIR="${ARTIFACT_ROOT}/${BUILD_ID}"
+LOG_DIR="${LOG_ROOT}/${BUILD_ID}"
+BUILD_LOG="${LOG_DIR}/build.log"
+
+cleanup()
+{
+    rc=$?
+    trap - EXIT HUP INT TERM
+    jail -r "$JAIL_NAME" >/dev/null 2>&1 || true
+    rctl -r "jail:${JAIL_NAME}" >/dev/null 2>&1 || true
+    # `jail -c mount.devfs` does not unmount devfs when the jail is removed, and
+    # the leftover mount keeps the ZFS clone busy, so `zfs destroy` fails and
+    # every build leaks a ~2 GB clone plus its mount. Unmount explicitly, with a
+    # bounded retry because the unmount can briefly race jail teardown.
+    _attempt=0
+    while [ "$_attempt" -lt 5 ]; do
+        mount | grep -q " on ${JAIL_ROOT}/dev " || break
+        umount -f "${JAIL_ROOT}/dev" >/dev/null 2>&1 || true
+        _attempt=$((_attempt + 1))
+        sleep 1
+    done
+    zfs destroy -r "$CLONE_DATASET" >/dev/null 2>&1 || true
+    # The mountpoint directory survives the dataset; remove it so /tank/ci/work
+    # does not accumulate empty trees.
+    rmdir "${WORK_ROOT}/${BUILD_ID}/root" "${WORK_ROOT}/${BUILD_ID}" >/dev/null 2>&1 || true
+    if [ "$rc" -eq 0 ]; then result=SUCCESS; else result=FAILED; fi
+    printf '%s\n' "$result" > "${LOG_DIR}/result"
+    printf 'BUILD_ID=%s\nCOMMIT_SHA=%s\n' "$BUILD_ID" "$COMMIT_SHA" >> "${LOG_DIR}/result"
+    exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+install -d -o root -g wheel -m 0750 "$WORK_ROOT" "$LOG_ROOT"
+install -d -o root -g www -m 0755 "$ARTIFACT_ROOT" "$ARTIFACT_DIR"
+install -d -o root -g wheel -m 0750 "$LOG_DIR"
+zfs list -H "$JAILS_DATASET" >/dev/null 2>&1 || zfs create -o mountpoint=none "$JAILS_DATASET"
+zfs clone -o mountpoint="$JAIL_ROOT" "$BASE_SNAPSHOT" "$CLONE_DATASET"
+install -d -o root -g wheel -m 0755 "$JAIL_ROOT/build/src" "$JAIL_ROOT/build/dist" "$JAIL_ROOT/build/stage"
+
+git --git-dir="$REPOSITORY" archive --format=tar "$COMMIT_SHA" \
+    | tar -xf - -C "$JAIL_ROOT/build/src"
+
+devfs rule -s 100 delset >/dev/null 2>&1 || true
+devfs rule -s 100 add hide
+for device in null zero random urandom fd 'fd/*' stdin stdout stderr; do
+    devfs rule -s 100 add path "$device" unhide
+done
+
+jail -c \
+    name="$JAIL_NAME" \
+    path="$JAIL_ROOT" \
+    host.hostname="$JAIL_NAME" \
+    persist \
+    mount.devfs \
+    devfs_ruleset=100 \
+    ip4=disable \
+    ip6=disable \
+    allow.raw_sockets=0
+if rctl -a "jail:${JAIL_NAME}:memoryuse:deny=5G" 2>/dev/null; then
+    rctl -a "jail:${JAIL_NAME}:cputime:deny=3600"
+fi
+
+# POSIX /bin/sh has no portable localized pipefail, and enabling pipefail
+# globally would break grep/head pipelines in watch_build and prune_*. Capture
+# the command's exit status explicitly before tee sees EOF, failing closed if
+# the subshell dies without recording a numeric status.
+run_logged()
+{
+    _rc_file="${LOG_DIR}/.run_logged.rc"
+    rm -f "$_rc_file"
+    (
+        set +e
+        "$@" 2>&1
+        printf '%s\n' "$?" > "$_rc_file"
+    ) | tee -a "$BUILD_LOG"
+    _step_rc=1
+    if [ -f "$_rc_file" ] && [ ! -L "$_rc_file" ] && [ -s "$_rc_file" ]; then
+        _step_rc=$(cat "$_rc_file" 2>/dev/null || echo 1)
+    fi
+    rm -f "$_rc_file"
+    case "$_step_rc" in
+        ''|*[!0-9]*) _step_rc=1 ;;
+    esac
+    return "$_step_rc"
+}
+
+build_and_verify_in_jail()
+{
+    {
+        echo "BUILD_ID=$BUILD_ID"
+        echo "COMMIT_SHA=$COMMIT_SHA"
+        echo "STARTED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo 'Building in an offline disposable FreeBSD jail'
+    } | tee "$BUILD_LOG"
+
+    run_logged jexec "$JAIL_NAME" env -i \
+        PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+        HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+        STAGE=/build/stage DIST=/build/dist \
+        /bin/sh /build/src/ci/build.sh
+
+    PACKAGE=$(find "$JAIL_ROOT/build/dist" -xdev -type f -name 'gatebsd-*.pkg' ! -name '*-nodeps.pkg' | head -n 1)
+    [ -n "$PACKAGE" ] && [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || { echo 'GateBSD package was not produced.' >&2; exit 1; }
+    pkg info -F "$PACKAGE" >/dev/null
+
+    # Recreate the production defect before installing the package.  Both files
+    # were hand-written and therefore unowned: cron.d/ru-bypass was added first,
+    # then the same command was appended to /etc/crontab three days later.  A fresh
+    # jail alone proves only that the new schedule is present; this proves that an
+    # upgrade takes ownership of the canonical file and retires the second live
+    # registration.  The jail is disposable and has no network interfaces.
+    jexec "$JAIL_NAME" /bin/sh -c '
+        set -eu
+        install -d -o root -g wheel -m 0755 /usr/local/etc/cron.d
+        printf "%s\n" \
+          "# legacy unowned RU update schedule" \
+          "0 3 * * * root /usr/local/sbin/ru-bypass-update.sh >> /var/log/ru-bypass.log 2>&1" \
+          > /usr/local/etc/cron.d/ru-bypass
+        chmod 0644 /usr/local/etc/cron.d/ru-bypass
+        printf "%s\n" \
+          "0 3 * * * root /usr/local/sbin/ru-bypass-update.sh >> /var/log/ru-bypass.log 2>&1" \
+          >> /etc/crontab
+    '
+
+    run_logged jexec "$JAIL_NAME" pkg add -f "/build/dist/$(basename "$PACKAGE")"
+    run_logged jexec "$JAIL_NAME" /bin/sh -c '
+        set -eu
+        case "$(pkg which -q /usr/local/etc/cron.d/ru-bypass)" in gatebsd-*) ;; *) exit 1 ;; esac
+        [ "$(grep -Fxc "0 3 * * * root /usr/local/sbin/ru-bypass-update.sh >> /var/log/ru-bypass.log 2>&1" /usr/local/etc/cron.d/ru-bypass)" -eq 1 ]
+        ! grep -Fq "/usr/local/sbin/ru-bypass-update.sh" /etc/crontab
+    '
+    run_logged jexec "$JAIL_NAME" env -i \
+        PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+        HOME=/root LANG=C.UTF-8 \
+        PYTHONPATH=/usr/local/share/gatebsd/webui/backend \
+        /usr/local/libexec/gatebsd-python -m gatebsd_ui.integrity
+    run_logged jexec "$JAIL_NAME" env -i \
+        PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+        HOME=/root LANG=C.UTF-8 \
+        PYTHONPATH=/usr/local/share/gatebsd/webui/backend \
+        /usr/local/libexec/gatebsd-python -c \
+        'from gatebsd_ui import storage; assert storage.migrate() == storage.SCHEMA_VERSION'
+
+    if command -v jail >/dev/null 2>&1; then
+        jail -r "$JAIL_NAME" >/dev/null 2>&1 || true
+    fi
+    [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || { echo 'GateBSD package became missing or unsafe.' >&2; exit 1; }
+    _pkg_links=$(stat -c '%h' "$PACKAGE" 2>/dev/null || stat -f '%l' "$PACKAGE" 2>/dev/null || printf 1)
+    case "$_pkg_links" in ''|*[!0-9]*) _pkg_links=1 ;; esac
+    [ "$_pkg_links" -eq 1 ] || { echo 'GateBSD package has unexpected hardlinks.' >&2; exit 1; }
+    install -o root -g www -m 0644 "$PACKAGE" "$ARTIFACT_DIR/"
+    pkg info -F "${ARTIFACT_DIR}/$(basename "$PACKAGE")" >/dev/null
+}
+
+build_and_verify_in_jail
+
+# This script runs under `set -f` so that no untrusted value can ever be
+# expanded as a glob. Re-enable pathname expansion only for this one command, in
+# a subshell, over a directory whose contents we just wrote ourselves.
+(cd "$ARTIFACT_DIR" && set +f && sha256 ./*.pkg > SHA256)
+# `signer-type:keyfile` is the documented form; a bare path is accepted but the
+# explicit form makes the signing algorithm unambiguous.
+pkg repo "$ARTIFACT_DIR" "rsa:${SIGNING_KEY}" >> "$BUILD_LOG" 2>&1
+# Signing is the point of publishing here, so verify it happened rather than
+# trusting pkg's exit status: an unsigned catalogue would be silently accepted
+# by a client configured without signature_type.
+for _catalogue in data.pkg packagesite.pkg; do
+    tar tf "${ARTIFACT_DIR}/${_catalogue}" 2>/dev/null | grep -qx signature || {
+        echo "Repository catalogue ${_catalogue} is not signed." >&2
+        exit 1
+    }
+done
+install -o root -g www -m 0644 "$BUILD_LOG" "$ARTIFACT_DIR/build.log"
+
+# Publish the verified artifact under a stable, version-addressed path.
+#
+# The catalogue is copied rather than regenerated so that what an operator
+# installs is byte-identical to the tree whose signature was just verified above;
+# re-running `pkg repo` here would produce a second, unverified catalogue.
+#
+# Layout, mirroring the FreeBSD mirror publisher already proven on this host:
+#   builds/<BUILD_ID>/   real directory, chronological name, pruned by age
+#   versions/<VERSION>   symlink to a build, so 2.9.4 has one durable URL
+#   current              symlink to the newest published build
+publish_release()
+{
+    _version=$1
+
+    # A published version is immutable. The layout below made breaking that
+    # invisible: `versions/<VERSION>` is a symlink, so a second build of the
+    # same version swapped the pointer, left the first build sitting in
+    # builds/, and changed what the name resolved to without a word.
+    #
+    # That is not hypothetical. On 15 August 2026 a workflow_dispatch re-run of
+    # commit 35541ac republished 2.9.76: same tree, different package
+    # (fb793678... -> 873cd794...), because BUILD_ID is embedded and builds are
+    # not byte-identical. `pkg` on a device that had already fetched the first
+    # one would have seen the version it holds change underneath it.
+    #
+    # Checked before anything is staged, so a refusal costs nothing and leaves
+    # `current` where it was. Re-running the same BUILD_ID is allowed: that is
+    # idempotence, not a rewrite.
+    #
+    # GATEBSD_REPUBLISH=1 moves the pointer on purpose. It is an environment
+    # variable rather than a build flag deliberately -- what a version number is
+    # allowed to mean is an operator's decision, not a property of the tree.
+    _published="${RELEASE_ROOT}/versions/${_version}"
+    if [ -L "$_published" ]; then
+        _was=$(readlink "$_published")
+        _was=${_was##*/}
+        if [ "$_was" != "$BUILD_ID" ] && [ "${GATEBSD_REPUBLISH:-0}" != 1 ]; then
+            echo "Version ${_version} is already published as ${_was}." >&2
+            echo "Refusing to repoint it at ${BUILD_ID}." >&2
+            echo "Bump the version, or set GATEBSD_REPUBLISH=1 to replace it." >&2
+            exit 1
+        fi
+    fi
+
+    _staging="${RELEASE_ROOT}/builds/.staging.${BUILD_ID}"
+    _target="${RELEASE_ROOT}/builds/${BUILD_ID}"
+
+    install -d -o root -g www -m 0755 \
+        "$RELEASE_ROOT" "${RELEASE_ROOT}/builds" "${RELEASE_ROOT}/versions"
+    rm -rf "${_staging:?}"
+    install -d -o root -g www -m 0755 "$_staging"
+    cp -R "$ARTIFACT_DIR"/. "$_staging"/
+    chown -R root:www "$_staging"
+    find "$_staging" -type f -exec chmod 0644 {} +
+    find "$_staging" -type d -exec chmod 0755 {} +
+
+    # Refuse to advertise a release that is missing either half of what a pkg(8)
+    # client needs. Publishing a package without its signed catalogue, or the
+    # reverse, produces a repository that fails only on the operator's machine.
+    #
+    # Staging is discarded before bailing out. Its name is dot-prefixed and so
+    # matches neither retention regex, meaning a leaked staging tree would sit in
+    # the release root forever.
+    [ -f "${_staging}/$(basename "$PACKAGE")" ] || {
+        rm -rf "${_staging:?}"
+        echo 'Release staging is missing the package.' >&2
+        exit 1
+    }
+    tar tf "${_staging}/packagesite.pkg" 2>/dev/null | grep -qx signature || {
+        rm -rf "${_staging:?}"
+        echo 'Release staging catalogue is not signed.' >&2
+        exit 1
+    }
+
+    rm -rf "${_target:?}"
+    mv "$_staging" "$_target"
+
+    # Symlinks are swapped by rename so a client fetching concurrently sees
+    # either the old or the new release, never a missing path. `mv -fh` replaces
+    # the link itself instead of following it into the directory it points at.
+    ln -s "builds/${BUILD_ID}" "${RELEASE_ROOT}/.current.${BUILD_ID}"
+    mv -fh "${RELEASE_ROOT}/.current.${BUILD_ID}" "${RELEASE_ROOT}/current"
+    ln -s "../builds/${BUILD_ID}" "${RELEASE_ROOT}/versions/.${_version}.${BUILD_ID}"
+    mv -fh "${RELEASE_ROOT}/versions/.${_version}.${BUILD_ID}" \
+        "${RELEASE_ROOT}/versions/${_version}"
+}
+
+# The version is the release's stable identity, so take it from the package
+# metadata rather than from the checkout: those disagree whenever VERSION is
+# bumped without a matching build, and the package is what gets installed.
+VERSION=$(pkg query -F "$PACKAGE" '%v')
+printf '%s' "$VERSION" | grep -qE '^[0-9A-Za-z._,+-]+$' || {
+    echo "Package version is not usable as a path component: ${VERSION}" >&2
+    exit 1
+}
+publish_release "$VERSION"
+
+# Bound artifact and log growth. Build IDs start with a fixed-width UTC stamp,
+# so a lexical sort is chronological.
+prune_builds()
+{
+    _root=$1
+    _keep=$2
+    [ -d "$_root" ] || return 0
+    ls "$_root" 2>/dev/null |
+        grep -E '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$' |
+        sort |
+        awk -v keep="$_keep" '{ ids[NR] = $0 } END {
+            for (i = 1; i <= NR - keep; i++) print ids[i]
+        }' |
+    while IFS= read -r _stale; do
+        [ -n "$_stale" ] || continue
+        [ "$_stale" != "$BUILD_ID" ] || continue
+        rm -rf "${_root:?}/${_stale}"
+    done
+}
+prune_builds "$ARTIFACT_ROOT" "$KEEP_BUILDS"
+prune_builds "$LOG_ROOT" "$KEEP_BUILDS"
+
+# Retire superseded releases oldest-first. Unlike prune_builds this must never
+# remove a build that a `versions/<VERSION>` or `current` symlink still resolves
+# to: doing so would leave an advertised URL pointing at nothing, which is how a
+# repository silently stops working for an operator mid-upgrade.
+prune_releases()
+{
+    _keep=$1
+    _builds="${RELEASE_ROOT}/builds"
+    [ -d "$_builds" ] || return 0
+
+    # `find` rather than a glob: this script runs under `set -f`, so a pattern
+    # would be passed through literally and every release would look unreferenced.
+    _referenced="${RELEASE_ROOT}/.referenced.${BUILD_ID}"
+    : > "$_referenced"
+    find "${RELEASE_ROOT}/current" "${RELEASE_ROOT}/versions" \
+        -maxdepth 1 -type l -print 2>/dev/null |
+    while IFS= read -r _link; do
+        _dest=$(readlink "$_link" || true)
+        [ -n "$_dest" ] || continue
+        printf '%s\n' "${_dest##*/}" >> "$_referenced"
+    done
+
+    ls "$_builds" 2>/dev/null |
+        grep -E '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$' |
+        sort |
+        awk -v keep="$_keep" '{ ids[NR] = $0 } END {
+            for (i = 1; i <= NR - keep; i++) print ids[i]
+        }' |
+    while IFS= read -r _stale; do
+        [ -n "$_stale" ] || continue
+        [ "$_stale" != "$BUILD_ID" ] || continue
+        if grep -qxF "$_stale" "$_referenced"; then
+            continue
+        fi
+        rm -rf "${_builds:?}/${_stale}"
+    done
+    rm -f "$_referenced"
+
+    # A version symlink whose build is gone is worse than no symlink: pkg(8)
+    # reports a fetch error rather than an absent repository. Drop the danglers.
+    find "${RELEASE_ROOT}/versions" -maxdepth 1 -type l -print 2>/dev/null |
+    while IFS= read -r _link; do
+        [ -d "$_link" ] || rm -f "$_link"
+    done
+}
+prune_releases "$KEEP_RELEASES"
+
+printf 'BUILD_ID=%s\n' "$BUILD_ID"
+printf 'VERSION=%s\n' "$VERSION"
+printf 'ARTIFACT_URL=http://mirror.example.lan/ci/artifacts/%s/\n' "$BUILD_ID"
+printf 'RELEASE_URL=http://mirror.example.lan/%s/releases/versions/%s/\n' "$PROJECT_SLUG" "$VERSION"
+printf 'CURRENT_URL=http://mirror.example.lan/%s/releases/current/\n' "$PROJECT_SLUG"

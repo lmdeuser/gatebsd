@@ -1,0 +1,19 @@
+# Global
+maxretry = 3
+
+[ippon]
+    driver = nutdrv_qx
+    port = /dev/cuaU0
+    desc = "Ippon Back Basic 2200 Euro"
+    pollinterval = 5
+
+    # Delay before cutting load (seconds)
+    offdelay = 90
+    # Delay before restoring load after power returns
+    ondelay = 180
+
+    allow_killpower
+
+    # Low battery thresholds
+    override.battery.charge.low = 30
+    override.battery.runtime.low = 600

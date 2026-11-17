@@ -1,0 +1,79 @@
+#!/bin/sh
+# Create one device's NUT configuration without ever replacing an operator's.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+NUT_DIR=${GATEBSD_NUT_DIR:-/usr/local/etc/nut}
+TEMPLATE_DIR=${GATEBSD_NUT_TEMPLATE_DIR:-/usr/local/share/gatebsd/etc/nut}
+NUT_GROUP=${GATEBSD_NUT_GROUP:-nut}
+
+files='nut.conf ups.conf upsd.conf upsd.users upsmon.conf'
+case "$#:${1:-}" in
+    0:) check_only=0 ;;
+    1:--check) check_only=1 ;;
+    *) echo "usage: gatebsd-ups-bootstrap [--check]" >&2; exit 2 ;;
+esac
+present=0
+for name in $files; do
+    path="$NUT_DIR/$name"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        [ -f "$path" ] && [ ! -L "$path" ] || { echo "unsafe NUT config: $path" >&2; exit 1; }
+        present=$((present + 1))
+    fi
+done
+
+if [ "$present" -eq 5 ]; then
+    for name in $files; do
+        grep -qs 'CHANGEME_' "$NUT_DIR/$name" && {
+            echo "NUT configuration still contains image credentials" >&2
+            exit 1
+        }
+    done
+    monitor=$(awk '$1 == "MONITOR" && NF >= 6 {print $4 " " $5; exit}' "$NUT_DIR/upsmon.conf")
+    set -- $monitor
+    [ "$#" -eq 2 ] || { echo "NUT monitor credentials are incomplete" >&2; exit 1; }
+    monitor_user=$1
+    monitor_password=$2
+    case "$monitor_user" in ''|*[!A-Za-z0-9_.-]*) echo "unsafe NUT monitor user" >&2; exit 1 ;; esac
+    stored_password=$(awk -v wanted="[$monitor_user]" '
+        /^\[/ {inside = ($0 == wanted)}
+        inside && $1 == "password" && $2 == "=" {print $3; exit}
+    ' "$NUT_DIR/upsd.users")
+    [ -n "$stored_password" ] && [ "$stored_password" = "$monitor_password" ] || {
+        echo "NUT monitor credentials do not match upsd.users" >&2
+        exit 1
+    }
+    exit 0
+fi
+[ "$present" -eq 0 ] || { echo "partial NUT configuration; refusing to invent the missing half" >&2; exit 1; }
+[ "$check_only" -eq 0 ] || { echo "NUT configuration is absent" >&2; exit 1; }
+
+command -v openssl >/dev/null 2>&1 || { echo "openssl is required for NUT credentials" >&2; exit 1; }
+for name in $files; do
+    [ -f "$TEMPLATE_DIR/$name.sample" ] && [ ! -L "$TEMPLATE_DIR/$name.sample" ] \
+        || { echo "missing NUT template: $name.sample" >&2; exit 1; }
+done
+
+if [ -e "$NUT_DIR" ] || [ -L "$NUT_DIR" ]; then
+    [ -d "$NUT_DIR" ] && [ ! -L "$NUT_DIR" ] || { echo "unsafe NUT directory: $NUT_DIR" >&2; exit 1; }
+else
+    install -d -m 0750 "$NUT_DIR"
+fi
+master=$(openssl rand -hex 24)
+client=$(openssl rand -hex 24)
+[ "$master" != "$client" ] || exit 1
+
+tmp=''
+cleanup() { [ -z "$tmp" ] || rm -f "$tmp"; }
+trap cleanup EXIT HUP INT TERM
+for name in $files; do
+    tmp=$(mktemp "$NUT_DIR/.gatebsd-ups-bootstrap.XXXXXX")
+    sed -e "s/CHANGEME_1/$master/g" -e "s/CHANGEME_2/$client/g" \
+        "$TEMPLATE_DIR/$name.sample" > "$tmp"
+    chmod 0640 "$tmp"
+    if [ "$(id -u)" -eq 0 ]; then chown "root:$NUT_GROUP" "$tmp"; fi
+    mv -f "$tmp" "$NUT_DIR/$name"
+    tmp=''
+done
+trap - EXIT HUP INT TERM
+exit 0

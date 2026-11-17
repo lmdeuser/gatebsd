@@ -1,0 +1,240 @@
+#!/bin/sh
+# PROVIDE: gatewayctl_apply
+# REQUIRE: NETWORKING gatebsd_lock_cleanup mpd5 ru_bypass
+# KEYWORD: shutdown
+#
+# "mpd" and "amnezia" were not real providers; see the note in rc.d/ru_bypass.
+#
+# `gatewayctl apply` must never run synchronously on the boot path. It calls
+# awg-quick up, which resolves the peer endpoint through the resolver with no
+# timeout of its own, and then waits up to VPN_HANDSHAKE_WAIT seconds for a
+# handshake. With a dead or slow upstream DNS that stalls /etc/rc before
+# LOGIN, so the router never finishes booting: no sshd, no nginx, no web UI --
+# an unreachable box whose only uplink is the very link being configured.
+# The work is therefore daemonised exactly the way rc.d/ru_bypass does it, and
+# boot continues while the tunnel comes up in the background.
+
+. /etc/rc.subr
+
+name="gatewayctl_apply"
+rcvar="gatewayctl_apply_enable"
+desc="Activate the GateBSD VPN gateway without blocking system boot"
+pidfile="/var/run/gatebsd/gatewayctl-apply.pid"
+start_cmd="gatewayctl_apply_start"
+stop_cmd="gatewayctl_apply_stop"
+status_cmd="gatewayctl_apply_status"
+
+_validate_timeouts() {
+    for _value in "$gatewayctl_apply_stop_timeout" "$gatewayctl_apply_handshake_wait" \
+                  "$gatewayctl_apply_endpoint_wait"; do
+        case "$_value" in ''|*[!0-9]*) echo "Invalid gatewayctl_apply timeout: $_value" >&2; return 1 ;; esac
+    done
+    # Generous on purpose, and free: this service daemonises the work, so a
+    # long wait here delays nothing. The endpoint is resolved against an
+    # upstream server and therefore cannot answer until PPPoE has dialled.
+    # Measured on the router 2026-07-31: halt 10:11:42, apply 10:14:13, the
+    # resolver gave up 10:15:41, and the tunnel only entered the path at
+    # 10:17:37 -- because nothing retried until the watchdog's next tick. Six
+    # minutes of a LAN in the clear, none of it a failure, all of it impatience.
+    [ "$gatewayctl_apply_endpoint_wait" -ge 1 ] && [ "$gatewayctl_apply_endpoint_wait" -le 600 ] || {
+        echo "gatewayctl_apply_endpoint_wait must be between 1 and 600 seconds" >&2
+        return 1
+    }
+    [ "$gatewayctl_apply_stop_timeout" -ge 1 ] && [ "$gatewayctl_apply_stop_timeout" -le 120 ] || {
+        echo "gatewayctl_apply_stop_timeout must be between 1 and 120 seconds" >&2
+        return 1
+    }
+    [ "$gatewayctl_apply_handshake_wait" -ge 1 ] && [ "$gatewayctl_apply_handshake_wait" -le 120 ] || {
+        echo "gatewayctl_apply_handshake_wait must be between 1 and 120 seconds" >&2
+        return 1
+    }
+}
+
+_validate_runtime_paths() {
+    _run_dir=${pidfile%/*}
+    if [ -e "$_run_dir" ] || [ -L "$_run_dir" ]; then
+        [ -d "$_run_dir" ] && [ ! -L "$_run_dir" ] || {
+            echo "Unsafe GateBSD runtime directory: $_run_dir" >&2
+            return 1
+        }
+        _uid=$(stat -f '%u' "$_run_dir" 2>/dev/null || printf '%s' -1)
+        _mode=$(stat -f '%Lp' "$_run_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_uid" = 0 ] || { echo "GateBSD runtime directory must be root-owned" >&2; return 1; }
+        case "$_mode" in
+            *[2367][0-7]|*[0-7][2367]) echo "GateBSD runtime directory must not be group/world writable" >&2; return 1 ;;
+        esac
+    else
+        install -d -o root -g gatebsd -m 0750 "$_run_dir" || return 1
+    fi
+
+    if [ -e "$pidfile" ] || [ -L "$pidfile" ]; then
+        [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || {
+            echo "Unsafe gatewayctl apply pidfile: $pidfile" >&2
+            return 1
+        }
+    fi
+}
+
+# PIDs are recycled, so a stale pidfile must never be signalled blindly: the
+# recycled PID could belong to mpd5 and killing it would drop PPPoE.
+_valid_worker_pid() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ] 2>/dev/null || return 1
+    _command=$(ps -p "$1" -o command= 2>/dev/null || true)
+    case "$_command" in
+        *lockf*gatewayctl*apply*|*lockf*gatewayctl*up*|*gatewayctl*apply*|*gatewayctl*up*)
+            kill -0 "$1" 2>/dev/null
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+_read_worker_pid() {
+    [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || return 1
+    _pid=$(sed -n '1p' "$pidfile" 2>/dev/null | tr -d '[:space:]')
+    _valid_worker_pid "$_pid" || return 1
+    printf '%s\n' "$_pid"
+}
+
+_remove_stale_pidfile() {
+    # daemon(8) keeps its child pidfile locked for as long as its supervisor
+    # lives. Removing it under lockf proves that no live supervisor still owns
+    # this pathname; a bounded retry absorbs the supervisor's asynchronous exit.
+    _wait=0
+    while [ "$_wait" -lt 20 ]; do
+        [ -e "$pidfile" ] || return 0
+        lockf -t 0 "$pidfile" /bin/rm -f "$pidfile" 2>/dev/null && return 0
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    echo "gatewayctl apply pidfile is still locked by another process: $pidfile" >&2
+    return 1
+}
+
+# The whole process group must be signalled, not just the child PID recorded in
+# the pidfile. Verified on FreeBSD 15.1: `daemon -f -p` makes the supervisor the
+# process-group leader, and TERM-ing only the child leaves the supervisor alive
+# (still holding the pidfile lock, so the next start fails with "already
+# locked") and leaves the child's own children -- here awg-quick and its
+# resolver -- orphaned and running. Signalling the group ends all three, frees
+# the lock and unlinks the pidfile.
+_worker_pgid() {
+    _pgid=$(ps -p "$1" -o pgid= 2>/dev/null | tr -d '[:space:]')
+    case "$_pgid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_pgid" -gt 1 ] || return 1
+    printf '%s\n' "$_pgid"
+}
+
+_stop_worker() {
+    if ! _pid=$(_read_worker_pid); then
+        _remove_stale_pidfile || return 1
+        return 0
+    fi
+    echo "Stopping the in-progress gatewayctl apply (pid $_pid)..."
+    if _pgid=$(_worker_pgid "$_pid"); then
+        kill -TERM -"$_pgid" 2>/dev/null || true
+    else
+        kill -TERM "$_pid" 2>/dev/null || true
+    fi
+    _wait=0
+    _limit=$((gatewayctl_apply_stop_timeout * 4))
+    while [ "$_wait" -lt "$_limit" ]; do
+        if ! _valid_worker_pid "$_pid"; then
+            # The supervisor unlinks the pidfile asynchronously; make sure it is
+            # gone so a following start does not collide with it.
+            _remove_stale_pidfile || true
+            return 0
+        fi
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    # Do not SIGKILL: lockf forwards TERM and gatewayctl must finish its own
+    # compensating rollback (restore the WAN default) before it exits.
+    echo "gatewayctl apply did not stop within ${gatewayctl_apply_stop_timeout}s; it was left running to roll back safely." >&2
+    return 1
+}
+
+gatewayctl_apply_start() {
+    _validate_timeouts || return 1
+    _validate_runtime_paths || return 1
+
+    # The operator's own choice outranks the boot path. `gatewayctl apply` clears
+    # this marker when it succeeds, so without the check here every reboot -- and
+    # every package upgrade, which restarts this service -- would silently switch
+    # the tunnel back on for someone who had deliberately turned it off.
+    if [ -f "$gatewayctl_apply_disabled_flag" ] && [ ! -L "$gatewayctl_apply_disabled_flag" ]; then
+        echo "The VPN gateway is disabled by the operator; not activating it."
+        return 0
+    fi
+
+    if _pid=$(_read_worker_pid); then
+        echo "gatewayctl apply is already running as pid $_pid"
+        return 0
+    fi
+    _remove_stale_pidfile || return 1
+
+    echo "Scheduling VPN gateway activation in the background..."
+    /usr/sbin/daemon -f -p "$pidfile" -o "$gatewayctl_apply_log" \
+        env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+        HOME=/root LANG=C.UTF-8 \
+        VPN_HANDSHAKE_WAIT="$gatewayctl_apply_handshake_wait" \
+        VPN_ENDPOINT_WAIT="$gatewayctl_apply_endpoint_wait" \
+        /usr/local/sbin/gatewayctl apply || return 1
+
+    # Detect an immediate launch failure without waiting for the tunnel.
+    _wait=0
+    while [ "$_wait" -lt 8 ]; do
+        _read_worker_pid >/dev/null 2>&1 && return 0
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    # An already-established tunnel lets the worker finish before the first
+    # probe; a live default route through the VPN is success, not a failure.
+    # The log is not consulted here: it is append-only across boots, so an old
+    # success line would mask a real launch failure.
+    gatewayctl_apply_status >/dev/null 2>&1 && return 0
+    echo "gatewayctl apply worker did not start; see $gatewayctl_apply_log" >&2
+    return 1
+}
+
+gatewayctl_apply_stop() {
+    _validate_timeouts || return 1
+    _validate_runtime_paths || return 1
+
+    # A background apply holds the gateway lock, and gatewayctl takes it with
+    # `lockf -t 5`. Without stopping the worker first, `down` would simply time
+    # out on the lock and leave the default route inside the tunnel.
+    _stop_worker || return 1
+
+    echo "Rolling back to the configured WAN gateway..."
+    # `teardown`, not `down`: this runs on the shutdown path too, and `down`
+    # records "the operator turned the VPN off" -- a marker that survives the
+    # reboot and stops the watchdog from ever putting the tunnel back.
+    /usr/local/sbin/gatewayctl teardown >> "$gatewayctl_apply_log" 2>&1
+}
+
+gatewayctl_apply_status() {
+    _validate_runtime_paths || return 1
+    if _pid=$(_read_worker_pid); then
+        echo "gatewayctl apply is running as pid $_pid"
+        return 0
+    fi
+    _iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+    case "$_iface" in
+        awg*|wg*|tun*)
+            echo "The default route is active on the VPN interface $_iface"
+            return 0
+            ;;
+    esac
+    echo "The VPN gateway is not active (default route via ${_iface:-none})"
+    return 1
+}
+
+load_rc_config "$name"
+: ${gatewayctl_apply_enable:="NO"}
+: ${gatewayctl_apply_stop_timeout:="30"}
+: ${gatewayctl_apply_handshake_wait:="15"}
+: ${gatewayctl_apply_endpoint_wait:="180"}
+: ${gatewayctl_apply_log:="/var/log/gatewayctl.log"}
+: ${gatewayctl_apply_disabled_flag:="/var/db/gatebsd/vpn_disabled"}
+run_rc_command "$1"

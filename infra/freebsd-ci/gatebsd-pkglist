@@ -1,0 +1,48 @@
+# Ports poudriere builds for the appliance, and why each one is here.
+#
+# The other half of packages.list. That file declares what the stand itself
+# needs in order to run; this one declares what the stand BUILDS for the
+# device. Both are read by install-ci-host.sh and verify-deployment.sh, so an
+# installer that provides something and a verifier that expects something else
+# cannot disagree.
+#
+# Until now this list was a heredoc inside ci/host/configure_freebsd_mirror.sh,
+# and the copy on the stand had been edited away from it by hand: lang/python3
+# had become lang/python312, databases/py-sqlite3 had grown its @py312 flavour,
+# and net/amnezia-kmod and net/amnezia-tools -- what the router's VPN actually
+# runs on -- had been added. Nothing compared the two. Re-running that script
+# would have dropped amnezia from the built set without a word, and the failure
+# would have surfaced weeks later as "the update broke the VPN". The script no
+# longer writes this file; a hand edit here is now reported as drift.
+#
+# The FLAVOR is part of the origin: databases/py-sqlite3@py312 and
+# databases/py-sqlite3@py311 are different builds. Moving the appliance to
+# another Python means changing both lines below, and ci/build.sh derives the
+# flavour it stamps into the package from the jail, so the build jail
+# (ci/host/prepare-gatebsd-build-jail.sh) has to move with them.
+#
+# Annotations are safe here: poudriere takes the first word of a line as the
+# origin and ignores the rest, and skips a line whose first word begins with
+# '#' -- common.sh, "Skip blank lines and comments".
+
+databases/py-sqlite3@py312   the panel's storage; the flavour must match lang/python312
+dns/unbound                  the resolver, and the adblock configuration it holds in memory
+lang/python312               the panel backend and every writer under it
+net/amnezia-kmod             AmneziaWG kernel module; the router's VPN data path
+net/amnezia-tools            awg(8) and awg-quick, in /usr/local/bin -- not on cron's PATH
+# amnezia-kmod 3.1 is the default data path for every supported AmneziaWG
+# generation. amneziawg-go remains installed for an operator's explicit
+# `UserLand = true` choice and for H1..H4 <= 4, which the kernel rejects.
+# All three Amnezia ports now come from the official FreeBSD tree; -O gatebsd
+# is still required for the Python overlays below.
+net/amneziawg-go             userspace AmneziaWG; explicit choice and low-header fallback
+net/isc-dhcp44-server        DHCP on the LAN side
+net/mpd5                     PPPoE to the primary carrier
+net/rsync                    backup and administrative file transfer; track security updates
+security/acme.sh             DuckDNS/Let's Encrypt renewal for the management TLS endpoint
+security/ca_root_nss         current Mozilla trust roots; must not retain compromised CAs
+security/p5-Authen-SASL      Perl authentication dependency; track security updates
+security/sudo                the boundary the panel crosses to reach its root agent
+sysutils/nut                 UPS monitoring; the stand reads this device's status over the network
+sysutils/smartmontools       disk health on the appliance
+www/nginx                    the panel's TLS front end and the local package repository

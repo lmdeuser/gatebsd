@@ -1,0 +1,9 @@
+# GateBSD watchdog health check — restart if dead.
+#
+# Every minute, not every five. This is the only thing that restores the
+# services after a bare `pkg upgrade`: pkg SIGKILLs everything its own scripts
+# leave running, so the package cannot start them itself, and five minutes
+# without WAN failover on every upgrade is not a bound worth having. The check
+# is a handful of `service onestatus` calls when nothing is wrong.
+* * * * * root /usr/local/sbin/gatebsd-healthcheck.sh
+* * * * * root PYTHONPATH=/usr/local/share/gatebsd/webui/backend /usr/local/libexec/gatebsd-python -m gatebsd_ui.recovery >> /var/log/gatebsd-recovery.log 2>&1

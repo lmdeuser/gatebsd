@@ -1,0 +1,16 @@
+# Where this device fetches its packages from.
+#
+# Written by the web panel, read by gatebsd-repo-bootstrap, which renders
+# /usr/local/etc/pkg/repos/gatebsd.conf from it. The panel never writes that
+# config itself: one managed file, one writer.
+#
+# Format is one entry per line, `<state>|<base-url>`. `state` is `active` for
+# the source in use or `known` for one that was found and kept for later;
+# exactly one entry may be active. The URL is a bare host with no path -- the
+# repository paths below it are this product's, not the operator's, and are
+# added by the renderer.
+#
+# Choosing a source decides where packages come from. It does NOT decide whose
+# signature is accepted: that is the stand's public key, and the renderer
+# writes its path as a literal.
+active|http://mirror.example.lan

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Move the stand's default route to the Wi-Fi leg (hn0) and load the pf ruleset
+# that forces traffic sourced from its address out through it. Run by hand:
+# this is the "the wire is bad" half of a manual failover pair.
+#
+# The route-to rule in the ruleset is why pf is enabled on this machine at all.
+# It is not a firewall here -- pf.conf passes everything -- it is a routing
+# primitive, and the comment in the ruleset says so.
+#
+# Carried in the repository since 27 August 2026; it lived only on the stand
+# before that.
+
+set -eu
+
+setfib 0 route delete default >/dev/null 2>&1 || true
+setfib 0 route delete -net 10.88.0.0/24 >/dev/null 2>&1 || true
+setfib 0 route add -net 10.88.0.0/24 -iface hn0
+setfib 0 route add default 10.88.0.1
+/sbin/pfctl -f /etc/pf.hyperv-wifi.conf

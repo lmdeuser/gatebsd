@@ -1,0 +1,95 @@
+# GateBSD blocklist additions and narrow ABP exceptions.
+#
+# Names we caught ourselves that no upstream list carries. Merged with the
+# downloaded sources and put through the same parser and the same shrink
+# protection, so a mistake here cannot wipe the blocklist.
+#
+# Editing a downloaded list instead would achieve nothing: the next update
+# replaces it. This file survives updates and upgrades.
+#
+# Found 2 August 2026 by dumping the resolver cache on a live router
+# (<local-adblock-audit-helper>): everything in that cache has by
+# definition already passed the filter, because blocked names are answered from
+# local-data and never get resolved upstream.
+0.0.0.0 ads.vk.com
+0.0.0.0 smi2.ru
+#
+# Google IMA SDK -- the library that splices video ad breaks into a player.
+# Found the same day by resolving the infrastructure of a site that still
+# showed ads: everything else it uses was already blocked (scripts.advmusic.com,
+# www.googletagmanager.com, unisound.cdnvideo.ru all answer 0.0.0.0), this one
+# resolved. One exact name: no other googleapis.com service is affected.
+#
+# Reversible on purpose. Some players wait for IMA and stall at start-up
+# without it; if playback breaks anywhere, delete this line.
+0.0.0.0 imasdk.googleapis.com
+#
+# --- Mobile app telemetry, 2 August 2026 ---------------------------------
+#
+# The user asked about RuStore. Russian Android apps do not carry Google's
+# ad SDKs; they carry these three, and none of the four downloaded lists has
+# them. Found by loading the RuStore site through this router and reading the
+# Resource Timing API, then confirming each name against DNS.
+#
+# READ THIS BEFORE ADDING A NAME HERE. "It resolves, so it exists and is a
+# gap" is false for these zones: vk.com, vk.ru, mail.ru and yandex.ru all
+# answer a WILDCARD, so ad.vk.com, vkads.vk.com and ads-api.vk.com resolve
+# just fine while being nothing at all -- their A sets are byte-identical to
+# zzqqxx-nonsense.vk.com. A name is real only when its addresses DIFFER from
+# what the zone hands a nonsense label. Every line below passed that test;
+# the vk.com ones did not, and are deliberately absent.
+#
+# myTracker -- VK's mobile attribution SDK, the one RuStore and most Russian
+# apps link against. Two names for one service, both real records.
+0.0.0.0 tracker.my.com
+0.0.0.0 mytracker.mail.ru
+#
+# mail.ru tracking. trk.mail.ru was caught in the act: the RuStore site
+# requested it while the page was loading.
+0.0.0.0 trk.mail.ru
+0.0.0.0 tracker.mail.ru
+#
+# VK Ads on the new .ru domain. ads.vk.com is blocked above; this twin was
+# not, and it is a real record (89.221.236.19), not the vk.ru wildcard.
+0.0.0.0 ads.vk.ru
+#
+# Yandex AppMetrica -- mobile analytics. report.appmetrica.yandex.net was
+# already blocked by the downloaded lists, this entry point was not.
+#
+# Reversible on purpose: a few apps deliver push notifications through
+# AppMetrica. If push stops arriving somewhere, delete this line first.
+0.0.0.0 appmetrica.yandex.ru
+#
+# --- RuStore, caught on the phone itself, 3 August 2026 -------------------
+#
+# Not guessed from lists this time. The resolver cache was flushed, RuStore
+# was started clean on a phone whose default route is this router, its feed
+# was scrolled, and the cache was dumped again -- so every name below was
+# asked for inside that window. Attribution confirmed separately through the
+# app's own uid (10234) in /proc/net/tcp: it held sockets to 155.212.203.196
+# (rs.mail.ru) and 95.163.61.56 while the feed loaded.
+#
+# ads.rustore.ru is the interesting one: it resolves to 95.163.61.56, the
+# SAME address as backapi.rustore.ru, which the store cannot live without.
+# That costs us nothing -- DNS blocks a name, not an address, so the ad
+# endpoint dies and the catalogue keeps working. An IP-based filter could
+# not have made this distinction at all.
+0.0.0.0 ads.rustore.ru
+#
+# InAppStory -- the sponsored "stories" carousel at the top of the feed.
+# Blocking it loses the carousel; the store itself is unaffected.
+0.0.0.0 api.inappstory.ru
+#
+# mail.ru counters. Considered on 2 August and deliberately LEFT OUT for want
+# of evidence -- a name resolving under a wildcard zone proves nothing. The
+# phone supplied the evidence: RuStore connected to it.
+0.0.0.0 rs.mail.ru
+#
+# Left alone on purpose, so nobody re-adds them later: api.rustore.ru,
+# backapi.rustore.ru, rc.rustore.ru, static-rustore.cdn-vk.ru, api.vk.ru and
+# sun112-2.vkuserphoto.ru are the store, its CDN and its images. sdk.mail.ru
+# looks like VK ID and would take the login with it.
+
+# The Kimi browser extension calls this telemetry endpoint as part of its
+# normal operation. Keep the exception narrow: no other volces.com host changes.
+@@||gator.volces.com^

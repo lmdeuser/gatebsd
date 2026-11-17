@@ -1,0 +1,265 @@
+<!doctype html>
+<!--
+  CI/CD dashboard template. ci-dashboard-update(8) substitutes the
+  double-at-delimited placeholders below and expands the RUNS and RELEASES
+  placeholders into pre-rendered rows.
+
+  There is no JavaScript here on purpose. The generator already has privileged
+  read access to Forgejo's database; exposing that as a live API would mean
+  putting a request handler in front of it. Static files keep the privileged
+  reader on a cron timer and the web tier read-only.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>GateBSD CI/CD — Builds and Releases</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: Canvas;
+      color: CanvasText;
+      --line: color-mix(in srgb, CanvasText 18%, transparent);
+      --panel: color-mix(in srgb, CanvasText 4%, transparent);
+      --ok: #1a7f37;
+      --bad: #cf222e;
+      --warn: #9a6700;
+      --idle: #57606a;
+    }
+    * { box-sizing: border-box; }
+    body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+    a { color: LinkText; }
+    h1 { margin: 0 0 4px; font-size: 1.6rem; }
+    h2 { margin: 40px 0 12px; font-size: 1.15rem; }
+    .sub { color: GrayText; margin: 0; font-size: 0.92rem; }
+    nav.crumbs { margin-bottom: 20px; font-size: 0.9rem; }
+    nav.crumbs a { margin-right: 14px; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+      background: var(--panel);
+    }
+    .card .label {
+      display: block;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: GrayText;
+      margin-bottom: 6px;
+    }
+    .card .value { font-size: 1.25rem; font-weight: 600; }
+    .card .value.small { font-size: 1rem; font-weight: 500; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 600;
+      color: #fff;
+      background: var(--idle);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      white-space: nowrap;
+    }
+    .badge.success, .badge.online, .badge.ready { background: var(--ok); }
+    .badge.failure, .badge.offline, .badge.missing { background: var(--bad); }
+    .badge.running, .badge.waiting { background: var(--warn); }
+    .badge.skipped, .badge.cancelled, .badge.unknown { background: var(--idle); }
+
+    article.run {
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--idle);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 12px;
+      background: var(--panel);
+    }
+    article.run.success { border-left-color: var(--ok); }
+    article.run.failure { border-left-color: var(--bad); }
+    article.run.running { border-left-color: var(--warn); }
+    article.run > header {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .runid { font-weight: 700; text-decoration: none; }
+    .runtitle { font-weight: 500; }
+    .meta {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 0.85rem;
+      color: GrayText;
+    }
+    .meta .branch, .meta .sha {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    ul.jobs { list-style: none; margin: 12px 0 0; padding: 0; }
+    li.job {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px 0;
+      font-size: 0.9rem;
+      border-top: 1px solid var(--line);
+    }
+    li.job .jobname { flex: 1; font-weight: 500; }
+    .artifact { margin-top: 10px; font-size: 0.88rem; }
+    .artifact .pkg {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-right: 12px;
+    }
+    .muted { color: GrayText; font-size: 0.85rem; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+    th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; color: GrayText; }
+    tr.current td { background: color-mix(in srgb, var(--ok) 10%, transparent); }
+    tr.broken td { color: var(--bad); }
+
+    details.howto {
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 16px;
+      background: var(--panel);
+    }
+    details.howto summary { cursor: pointer; font-weight: 600; }
+    pre {
+      overflow-x: auto;
+      background: color-mix(in srgb, CanvasText 7%, transparent);
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 0.84rem;
+    }
+    ol.steps { padding-left: 22px; }
+    ol.steps li { margin: 8px 0; }
+    footer { margin-top: 48px; color: GrayText; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <nav class="crumbs">
+    <a href="/">← Build Stand Services</a>
+    <a href="@@FORGE_URL@@/@@REPO_SLUG@@">Repository</a>
+    <a href="@@FORGE_URL@@/@@REPO_SLUG@@/actions">Forgejo Actions</a>
+    <a href="/@@PROJECT_SLUG@@/releases/current/">Current Release</a>
+    <a href="status.json">JSON</a>
+  </nav>
+
+  <h1>GateBSD CI/CD</h1>
+  <p class="sub">
+    Builds, job logs, and published packages. Refreshed automatically;
+    generated <strong>@@GENERATED@@</strong> UTC.
+  </p>
+
+  <section class="cards">
+    <div class="card">
+      <span class="label">Latest Build</span>
+      <span class="value">
+        <span class="badge @@PIPELINE_STATE@@">@@PIPELINE_STATE@@</span>
+        #@@NEWEST_INDEX@@
+      </span>
+    </div>
+    <div class="card">
+      <span class="label">Finished</span>
+      <span class="value small">@@NEWEST_FINISHED@@</span>
+    </div>
+    <div class="card">
+      <span class="label">Current Release</span>
+      <span class="value">@@CURRENT_VERSION@@</span>
+    </div>
+    <div class="card">
+      <span class="label">Runner</span>
+      <span class="value small">
+        <span class="badge @@RUNNER_STATE@@">@@RUNNER_STATE@@</span>
+        @@RUNNER_NAME@@ @@RUNNER_VERSION@@
+      </span>
+    </div>
+    <div class="card">
+      <span class="label">Mirror</span>
+      <span class="value small">
+        <span class="badge @@MIRROR_READY@@">@@MIRROR_READY@@</span>
+      </span>
+    </div>
+    <div class="card">
+      <span class="label">Free on tank</span>
+      <span class="value small">@@DISK_FREE@@</span>
+    </div>
+  </section>
+
+  <h2>Release and Installation Flow</h2>
+  <ol class="steps">
+    <li>
+      <strong>Push to master.</strong> The pipeline triggers automatically. The
+      <code>dev</code> branch and pull requests run validation only without publishing
+      a package.
+    </li>
+    <li>
+      <strong>Wait for a green run.</strong> The <code>validate</code> job checks
+      syntax and unit tests; <code>freebsd-package</code> builds inside a
+      disposable FreeBSD jail, signs, and publishes. Both appear below with logs.
+    </li>
+    <li>
+      <strong>Verify the package.</strong> It appears in the releases table marked
+      <code>current</code> with its signature status.
+    </li>
+    <li>
+      <strong>Install.</strong> In the GateBSD Web UI: System → Updates. The
+      installer snapshots rollback artifacts and rolls back automatically if
+      post-install checks fail.
+    </li>
+  </ol>
+
+  <details class="howto">
+    <summary>Manual install via pkg(8)</summary>
+    <p class="sub">
+      The repository is signed. Setting <code>signature_type: pubkey</code>
+      is mandatory so pkg rejects unsigned catalogues.
+    </p>
+    <pre><code># /usr/local/etc/pkg/repos/gatebsd.conf
+gatebsd-releases: {
+    url: "@@BASE_URL@@/@@PROJECT_SLUG@@/releases/current",
+    mirror_type: "none",
+    signature_type: "pubkey",
+    pubkey: "/usr/local/etc/ssl/certs/pkg.pub",
+    enabled: yes
+}
+
+# then
+pkg update -r gatebsd-releases
+pkg upgrade -r gatebsd-releases gatebsd</code></pre>
+  </details>
+
+  <h2>Releases</h2>
+  <table>
+    <thead>
+      <tr><th>Version</th><th>Published (UTC)</th><th>Size</th><th>Integrity</th></tr>
+    </thead>
+    <tbody>
+@@RELEASES@@
+    </tbody>
+  </table>
+
+  <h2>Builds</h2>
+@@RUNS@@
+
+  <footer>
+    Data is read from Forgejo read-only and published statically.
+    Full run history, re-runs, and cancellation are in
+    <a href="@@FORGE_URL@@/@@REPO_SLUG@@/actions">Actions</a> (login required).
+  </footer>
+</body>
+</html>

@@ -1,0 +1,10 @@
+Defaults:ci_deployer !requiretty
+Defaults:ci_deployer env_reset
+Defaults:ci_deployer secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ONE granted command, and that is the CI trust boundary rather than an
+# accident of history. Release 2.9.90 failed because a second privileged helper
+# was added with a manifest row, a dispatcher verb and a workflow step but no
+# line here. The fix was not to widen this file: the verification became a mode
+# of the command already granted, so the boundary did not move at all.
+ci_deployer ALL=(root) NOPASSWD: /usr/local/libexec/gatebsd-ci-build

@@ -1,0 +1,53 @@
+#!/bin/sh
+# PROVIDE: gatebsd_firstboot
+# REQUIRE: FILESYSTEMS
+# BEFORE: NETWORKING sshd
+# KEYWORD: firstboot
+#
+# Runs before sshd and before the management stack, because both of them are
+# what would otherwise be published using the identity baked into the shipped
+# image: sshd would present the image's host keys, and GateBSD's UI the image's
+# TLS certificate. Provisioning after they start would mean every unit answers
+# with a shared identity for the length of its first boot, and any unit already
+# trusted by an operator would silently change identity underneath them later.
+#
+# It is safe to leave enabled permanently. The provisioner records each step it
+# completes, so subsequent boots do nothing.
+
+. /etc/rc.subr
+
+name="gatebsd_firstboot"
+rcvar="gatebsd_firstboot_enable"
+desc="Give this device its own identity on first boot"
+start_cmd="gatebsd_firstboot_start"
+stop_cmd=":"
+status_cmd="gatebsd_firstboot_status"
+
+gatebsd_firstboot_start()
+{
+    [ -x "$gatebsd_firstboot_command" ] || {
+        warn "provisioner is missing: $gatebsd_firstboot_command"
+        return 1
+    }
+    # Deliberately synchronous, unlike the VPN apply on the boot path. This
+    # cannot be backgrounded: sshd must not start before the host keys are the
+    # device's own, and that ordering is the entire point of the script.
+    "$gatebsd_firstboot_command"
+}
+
+gatebsd_firstboot_status()
+{
+    if [ -f "${gatebsd_firstboot_state}/ssh_host_keys.done" ] &&
+       [ -f "${gatebsd_firstboot_state}/tls_certificate.done" ]; then
+        echo "This device has its own identity."
+        return 0
+    fi
+    echo "This device still carries the identity from its image." >&2
+    return 1
+}
+
+load_rc_config "$name"
+: ${gatebsd_firstboot_enable:="YES"}
+: ${gatebsd_firstboot_command:="/usr/local/sbin/gatebsd-firstboot"}
+: ${gatebsd_firstboot_state:="/var/db/gatebsd-system/firstboot"}
+run_rc_command "$1"

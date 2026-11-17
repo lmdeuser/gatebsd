@@ -1,0 +1,24 @@
+# This host is primary (master)
+MONITOR ippon@localhost 1 upsmon-master CHANGEME_1 primary
+
+# Minimum required power supplies
+MINSUPPLIES 1
+
+# FreeBSD shutdown command
+SHUTDOWNCMD "/sbin/shutdown -p now"
+
+# Flag file for killpower (upsdrvctl shutdown)
+POWERDOWNFLAG /etc/killpower
+
+# Polling frequency (seconds)
+POLLFREQ 5
+POLLFREQALERT 5
+
+# Max wait for secondary clients (seconds)
+HOSTSYNC 15
+
+# Mark UPS dead after (seconds)
+DEADTIME 20
+
+# Delay before SHUTDOWNCMD (seconds)
+FINALDELAY 5

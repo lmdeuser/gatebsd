@@ -1,0 +1,668 @@
+#!/bin/sh
+# gatewayctl — serialized FreeBSD AmneziaWG gateway management.
+set -eu
+
+# Same shape as gatebsd-failoverctl: a fixed PATH in production, overridable so
+# the regression harness can substitute stubs. Both are root-only, so this does
+# not widen any trust boundary -- and without it nothing could observe which
+# commands this script actually runs.
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+export PATH
+
+CONF=${GATEBSD_GATEWAY_CONF:-/usr/local/etc/amnezia/gateway.conf}
+LOCK_FILE=${GATEBSD_GATEWAY_LOCK_FILE:-/var/run/gatebsd/gatewayctl.lock}
+PF_LOCK_FILE=${GATEBSD_PF_LOCK_FILE:-/etc/pf.conf.gatebsd.lock}
+STATE_FILE=${GATEBSD_WATCHDOG_STATE:-/var/run/gatebsd/watchdog.json}
+VPN_DISABLED_FLAG=${GATEBSD_VPN_DISABLED_FLAG:-/var/db/gatebsd/vpn_disabled}
+ROUTE_HELPER=${GATEBSD_ROUTE_HELPER:-/usr/local/sbin/gatebsd-route-op}
+STATE_READER=${GATEBSD_STATE_READER:-/usr/local/sbin/gatebsd-state-value}
+PORT_FORWARD_RECONCILE=${GATEBSD_PORT_FORWARD_RECONCILE:-/usr/local/sbin/gatebsd-port-forward}
+PING_TIMEOUT=${PING_TIMEOUT:-2}
+CHECK_IP=${CHECK_IP:-1.1.1.1}
+# The TCP fallback for check_net. 0 disables it and leaves the ICMP verdict
+# alone -- which is only sensible on a link that answers echo.
+CHECK_TCP_PORT=${CHECK_TCP_PORT:-443}
+case "$CHECK_TCP_PORT" in
+    ''|*[!0-9]*) CHECK_TCP_PORT=443 ;;
+esac
+[ "$CHECK_TCP_PORT" -le 65535 ] || CHECK_TCP_PORT=443
+# How long to wait for a peer handshake before refusing to route the default
+# through the tunnel. Bounded so this can never stall boot indefinitely.
+VPN_HANDSHAKE_WAIT=${VPN_HANDSHAKE_WAIT:-15}
+case "$VPN_HANDSHAKE_WAIT" in
+    ''|*[!0-9]*) VPN_HANDSHAKE_WAIT=15 ;;
+esac
+[ "$VPN_HANDSHAKE_WAIT" -le 120 ] || VPN_HANDSHAKE_WAIT=120
+# How long, in wall-clock seconds, to wait for the peer endpoint hostname to
+# resolve before refusing to start the tunnel.
+#
+# The default is what an interactive caller should get: the panel and the
+# watchdog both want an answer, not patience. The boot path wants the opposite
+# and passes its own, larger budget -- see rc.d/gatewayctl_apply, where the
+# work is daemonised precisely so that waiting costs nothing there.
+#
+# The ceiling is 600 rather than 120 because the boot path's budget has to
+# cover PPPoE dialling: the endpoint is resolved against an upstream server, so
+# it cannot answer until the WAN is up, and until it answers there is no tunnel
+# and the LAN is in the clear.
+VPN_ENDPOINT_WAIT=${VPN_ENDPOINT_WAIT:-20}
+case "$VPN_ENDPOINT_WAIT" in
+    ''|*[!0-9]*) VPN_ENDPOINT_WAIT=20 ;;
+esac
+[ "$VPN_ENDPOINT_WAIT" -le 600 ] || VPN_ENDPOINT_WAIT=600
+
+log() { printf '[gatewayctl] %s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+safe_source() {
+    _path=$1
+    [ -f "$_path" ] && [ ! -L "$_path" ] || die "unsafe or missing config: $_path"
+    _uid=$(stat -f '%u' "$_path" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$_path" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || die "gateway config must be owned by root"
+    case "$_mode" in
+        *[2367][0-7]|*[0-7][2367]) die "gateway config must not be group/world writable" ;;
+    esac
+    # shellcheck disable=SC1090 -- validated root-owned configuration.
+    . "$_path"
+}
+
+is_ipv4() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 4 {exit 1}
+        { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1 }
+    '
+}
+
+is_hostname() {
+    _host=$1
+    [ -n "$_host" ] && [ ${#_host} -le 253 ] || return 1
+    case "$_host" in ''|*[!A-Za-z0-9.-]*|.*|*..*|*-|*.|-*) return 1 ;; esac
+}
+
+is_iface() {
+    _iface=$1
+    [ -n "$_iface" ] && [ ${#_iface} -le 32 ] || return 1
+    case "$_iface" in *[!A-Za-z0-9_.-]*|[0-9.-]*) return 1 ;; esac
+}
+
+safe_first_line() {
+    _path=$1
+    _limit=${2:-1048576}
+    [ -f "$_path" ] && [ ! -L "$_path" ] || return 1
+    _size=$(stat -f '%z' "$_path" 2>/dev/null || printf '%s' -1)
+    case "$_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_size" -le "$_limit" ] || return 1
+    sed -n '1p' "$_path"
+}
+
+safe_source "$CONF"
+: "${WAN_IF:=ng0}"
+: "${BACKUP_IF:=ue0}"
+: "${LAN_IF:=re1}"
+: "${VPN_IF:=awg0}"
+: "${VPN_MTU:=1420}"
+: "${VPN_ENDPOINT_PORT:=51820}"
+: "${WAN_GW_FALLBACK:=}"
+
+case "$PING_TIMEOUT" in ''|*[!0-9]*) die "invalid PING_TIMEOUT=$PING_TIMEOUT" ;; esac
+[ "$PING_TIMEOUT" -ge 1 ] && [ "$PING_TIMEOUT" -le 60 ] || die "PING_TIMEOUT out of range"
+is_ipv4 "$CHECK_IP" || is_hostname "$CHECK_IP" || die "invalid CHECK_IP=$CHECK_IP"
+for _iface in "$WAN_IF" "$BACKUP_IF" "$LAN_IF" "$VPN_IF"; do
+    is_iface "$_iface" || die "invalid interface name: $_iface"
+done
+case "$VPN_MTU" in ''|*[!0-9]*) die "invalid VPN_MTU=$VPN_MTU" ;; esac
+[ "$VPN_MTU" -ge 576 ] && [ "$VPN_MTU" -le 9000 ] || die "VPN_MTU out of range"
+case "$VPN_ENDPOINT_PORT" in ''|*[!0-9]*) die "invalid VPN_ENDPOINT_PORT=$VPN_ENDPOINT_PORT" ;; esac
+[ "$VPN_ENDPOINT_PORT" -ge 1 ] && [ "$VPN_ENDPOINT_PORT" -le 65535 ] || die "VPN endpoint port out of range"
+[ -z "$WAN_GW_FALLBACK" ] || is_ipv4 "$WAN_GW_FALLBACK" || die "invalid WAN_GW_FALLBACK"
+[ -x "$ROUTE_HELPER" ] || die "route helper is unavailable: $ROUTE_HELPER"
+[ -x "$STATE_READER" ] || die "state reader is unavailable: $STATE_READER"
+
+route_op() {
+    GATEBSD_GATEWAY_CONF="$CONF" \
+        GATEBSD_GATEWAY_LOCK_FILE="$LOCK_FILE" \
+        GATEBSD_ROUTE_HELPER="$ROUTE_HELPER" \
+        "$ROUTE_HELPER" "$@"
+}
+
+pppoe_gw() {
+    # The next hop is a field. An encapsulating interface prints `tunnel inet A
+    # --> B` above its address, and that line matches the shape too -- see the
+    # note over pppoe_gw in gatebsd-watchdog.sh.
+    _gateway=$(ifconfig "$WAN_IF" 2>/dev/null | awk '$1 == "inet" && $3 == "-->" { print $4; exit }')
+    is_ipv4 "$_gateway" && printf '%s\n' "$_gateway"
+}
+
+backup_gw() {
+    _lease="/var/db/dhclient.leases.${BACKUP_IF}"
+    [ -f "$_lease" ] && [ ! -L "$_lease" ] || return 1
+    _size=$(stat -f '%z' "$_lease" 2>/dev/null || printf '%s' -1)
+    case "$_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_size" -le 1048576 ] || return 1
+    _gateway=$(awk '/option routers/ {gsub(";", "", $3); gateway=$3} END {print gateway}' "$_lease" 2>/dev/null)
+    is_ipv4 "$_gateway" && printf '%s\n' "$_gateway"
+}
+
+active_underlay() {
+    _active=$("$STATE_READER" "$STATE_FILE" active_wan) || return 1
+    case "$_active" in
+        primary|backup) printf '%s\n' "$_active" ;;
+        '') printf '%s\n' primary ;;
+        *) return 1 ;;
+    esac
+}
+
+underlay_gateway() {
+    case "$1" in primary) pppoe_gw ;; backup) backup_gw ;; *) return 1 ;; esac
+}
+
+underlay_iface() {
+    case "$1" in primary) printf '%s\n' "$WAN_IF" ;; backup) printf '%s\n' "$BACKUP_IF" ;; *) return 1 ;; esac
+}
+
+wan_gw_best() {
+    _active=$(active_underlay) || return 1
+    _gateway=$(underlay_gateway "$_active" 2>/dev/null || true)
+    if [ -z "$_gateway" ]; then
+        if [ "$_active" = primary ]; then _gateway=$(backup_gw 2>/dev/null || true); else _gateway=$(pppoe_gw 2>/dev/null || true); fi
+    fi
+    [ -n "$_gateway" ] || _gateway=$WAN_GW_FALLBACK
+    printf '%s\n' "$_gateway"
+}
+
+wan_iface_best() {
+    _active=$(active_underlay) || return 1
+    _gateway=$(underlay_gateway "$_active" 2>/dev/null || true)
+    if [ -n "$_gateway" ]; then
+        underlay_iface "$_active"
+    elif [ "$_active" = primary ] && [ -n "$(backup_gw 2>/dev/null || true)" ]; then
+        printf '%s\n' "$BACKUP_IF"
+    else
+        printf '%s\n' "$WAN_IF"
+    fi
+}
+
+vpn_endpoint_ip() {
+    route_op endpoint-ip
+}
+
+# Reachability of the wider internet, decided the same way the watchdog decides
+# it: two probes, because "no echo reply" and "no transit" are different facts.
+#
+# The backup carrier on this device forwards TCP and UDP and drops ICMP echo to
+# public addresses. `gatebsd-watchdog.sh` has known that since the failover it
+# broke -- it carries probe_icmp and probe_tcp and remembers which one answered
+# on each link. This function did not: it was a bare ping, and it is what
+# `cmd_apply` uses to decide whether the tunnel it just committed the default
+# route to actually works. On the backup underlay that verdict was blind, and a
+# blind verdict here rolls a working VPN back to the WAN.
+#
+# ICMP first because it is cheap and usually true; TCP after, because when ICMP
+# is filtered its silence means nothing at all.
+check_net() {
+    ping -c 2 -W "$((PING_TIMEOUT * 1000))" "$CHECK_IP" >/dev/null 2>&1 && return 0
+    [ "$CHECK_TCP_PORT" != 0 ] || return 1
+    command -v nc >/dev/null 2>&1 || {
+        log "WARNING: nc is absent; the ICMP verdict is the only one available"
+        return 1
+    }
+    if nc -z -w "$PING_TIMEOUT" "$CHECK_IP" "$CHECK_TCP_PORT" >/dev/null 2>&1; then
+        log "$CHECK_IP answers on tcp/$CHECK_TCP_PORT but not to echo"
+        return 0
+    fi
+    return 1
+}
+
+# Confirm a peer has completed a handshake *before* the default route is
+# committed to the tunnel.
+#
+# Named for what it does. It used to be called vpn_carries_traffic, and the
+# watchdog leans on that name in a comment -- "apply proves the tunnel carries
+# traffic before it commits the default route to it". It does not: a handshake
+# is a necessary condition, not a sufficient one, and a tunnel whose MTU is too
+# large handshakes perfectly and then black-holes anything bigger. What catches
+# that is check_net after the commit, which is why check_net had to stop being
+# a bare ping. Without this the default route is switched first and only
+# then probed, so every apply has a window in which all traffic is aimed at an
+# unverified tunnel -- and on a router that is the site's only uplink, a failure
+# in that window is an outage rather than a failed command.
+vpn_has_handshake() {
+    _peers=$(awg show "$VPN_IF" latest-handshakes 2>/dev/null | awk '
+        NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > 0 { peers++ }
+        END { print peers + 0 }
+    ')
+    case "$_peers" in
+        ''|*[!0-9]*) _peers=0 ;;
+    esac
+    if [ "$_peers" -gt 0 ]; then
+        log "$VPN_IF has $_peers peer(s) with a completed handshake"
+        return 0
+    fi
+    # No handshake yet. awg-quick has only just brought the interface up, so
+    # allow a bounded settle period rather than failing a healthy cold start.
+    _waited=0
+    while [ "$_waited" -lt "$VPN_HANDSHAKE_WAIT" ]; do
+        sleep 1
+        _waited=$((_waited + 1))
+        _peers=$(awg show "$VPN_IF" latest-handshakes 2>/dev/null | awk '
+            NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > 0 { peers++ }
+            END { print peers + 0 }
+        ')
+        case "$_peers" in
+            ''|*[!0-9]*) _peers=0 ;;
+        esac
+        if [ "$_peers" -gt 0 ]; then
+            log "$VPN_IF handshake completed after ${_waited}s"
+            return 0
+        fi
+    done
+    log "no $VPN_IF peer completed a handshake within ${VPN_HANDSHAKE_WAIT}s" >&2
+    return 1
+}
+
+route_endpoint_via_wan() {
+    _gw=$(wan_gw_best)
+    _iface=$(wan_iface_best)
+    [ -n "$_gw" ] || { log "No active WAN gateway is available" >&2; return 1; }
+    log "pinning endpoint -> $_iface gw $_gw"
+    route_op pin-endpoint "$_iface" "$_gw"
+}
+
+unpin_endpoint() {
+    route_op unpin-endpoint
+}
+
+# Every path change goes through exactly these two functions, which is why the
+# resolver flush lives in them and not in `cmd_apply`. `apply`, `rollback_apply`,
+# `bypass` and `down` all move the default route, and all four leave the
+# resolver holding failures it learned over the path that is no longer in use.
+flush_resolver() {
+    route_op flush-resolver-negative \
+        || log "WARNING: resolver negative cache not flushed; stale failures may persist"
+}
+
+default_via_vpn() {
+    log "switching default -> $VPN_IF"
+    route_op set-default-if "$VPN_IF" || return 1
+    flush_resolver
+}
+
+default_via_wan() {
+    _gw=$(wan_gw_best)
+    _iface=$(wan_iface_best)
+    [ -n "$_gw" ] || { log "Cannot restore default: no WAN gateway available" >&2; return 1; }
+    log "restoring default -> $_iface gw $_gw"
+    route_op set-default-gw "$_gw" || return 1
+    flush_resolver
+}
+
+# awg-quick resolves the peer endpoint through the system resolver and has no
+# timeout of its own: on the boot path, where PPPoE is still dialling and unbound
+# has not started, it burns roughly seventy seconds of internal retries, fails
+# with "Configuration parsing error" and leaves a half-created interface behind
+# for the caller to destroy. Ask our own resolver first and give up quickly --
+# `route_endpoint_via_wan` needs the very same answer one step later, so nothing
+# that could have succeeded is refused here. A too-early attempt then costs one
+# bounded wait and one log line, and the watchdog retries when the link is ready.
+#
+# The budget is wall-clock seconds, and it has to be measured as such. It used
+# to count iterations of this loop, which are not seconds: each one is a
+# resolver call that can itself sit in a timeout, plus the sleep. Measured on
+# the router 2026-07-31 with the budget set to 20, the real wait was 88 seconds
+# -- and the operator reading the setting had no way to know. The name, the
+# comment and the range check all said seconds; only the arithmetic disagreed.
+#
+# Overshoot by one attempt is deliberate: the deadline is tested after trying,
+# so a budget of zero still asks once. That is what a caller who wants "try, do
+# not wait" means, and several do.
+endpoint_resolvable() {
+    _started=$(date +%s)
+    _deadline=$((_started + VPN_ENDPOINT_WAIT))
+    while :; do
+        if vpn_endpoint_ip >/dev/null 2>&1; then
+            _elapsed=$(( $(date +%s) - _started ))
+            [ "$_elapsed" -lt 2 ] || log "VPN endpoint resolved after ${_elapsed}s"
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$_deadline" ]; then
+            _elapsed=$(( $(date +%s) - _started ))
+            log "VPN endpoint did not resolve within ${VPN_ENDPOINT_WAIT}s (waited ${_elapsed}s)"
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+AWG_STARTED=0
+ensure_awg() {
+    if ifconfig "$VPN_IF" 2>/dev/null | grep -q 'UP'; then
+        log "$VPN_IF already up"
+    else
+        endpoint_resolvable || {
+            log "VPN endpoint ${VPN_ENDPOINT_HOST:-unset} does not resolve yet; not starting $VPN_IF" >&2
+            return 1
+        }
+        log "bringing up $VPN_IF"
+        AWG_QUICK_CONFIG_SEARCH_PATHS=/usr/local/etc/amnezia \
+            awg-quick up "$VPN_IF" || return 1
+        AWG_STARTED=1
+    fi
+    ifconfig "$VPN_IF" mtu "$VPN_MTU" >/dev/null 2>&1 || return 1
+}
+
+stop_awg() {
+    ifconfig "$VPN_IF" >/dev/null 2>&1 || { log "$VPN_IF absent"; return 0; }
+    log "stopping $VPN_IF"
+    AWG_QUICK_CONFIG_SEARCH_PATHS=/usr/local/etc/amnezia awg-quick down "$VPN_IF"
+}
+
+reconcile_port_forwards() {
+    [ -x "$PORT_FORWARD_RECONCILE" ] || return 0
+    _gateway=$(pppoe_gw 2>/dev/null || true)
+    [ -n "$_gateway" ] || { log "skipping port-forward reconcile without a WAN gateway"; return 0; }
+    "$PORT_FORWARD_RECONCILE" reconcile --gateway "$_gateway"
+}
+
+apply_pf_unlocked() {
+    [ -f /etc/pf.conf ] && [ ! -L /etc/pf.conf ] || return 1
+    pfctl -nf /etc/pf.conf || return 1
+    pfctl -f /etc/pf.conf
+}
+
+apply_pf() {
+    log "reloading pf"
+    if [ "${GATEBSD_PF_LOCK_HELD:-0}" = 1 ]; then
+        apply_pf_unlocked
+    else
+        if [ -e "$PF_LOCK_FILE" ]; then
+            [ -f "$PF_LOCK_FILE" ] && [ ! -L "$PF_LOCK_FILE" ] || return 1
+        fi
+        if ! env GATEBSD_GATEWAY_LOCK_HELD=1 GATEBSD_PF_LOCK_HELD=1 \
+                GATEBSD_GATEWAY_CONF="$CONF" GATEBSD_GATEWAY_LOCK_FILE="$LOCK_FILE" \
+                GATEBSD_PF_LOCK_FILE="$PF_LOCK_FILE" GATEBSD_ROUTE_HELPER="$ROUTE_HELPER" \
+                lockf -k -t 5 "$PF_LOCK_FILE" "$0" __apply-pf; then
+            return 1
+        fi
+    fi
+    log "pf OK"
+}
+
+# Neither /var/run/gatebsd nor /var/db/gatebsd belongs to this tool. The agent's
+# unix socket lives in the first and the UI's own credentials in the second, and
+# the web UI runs as the unprivileged service account, which needs the group bits
+# to reach both. `install -d -o root -g wheel` re-applies owner, group and mode to
+# a directory that already exists, so every apply -- including the automatic one
+# on the boot path -- reset the group to wheel, and from that moment the panel
+# answered "agent unavailable" to every request until someone noticed. Validate
+# what is already there and never re-own it; only a missing directory is created,
+# and then with the ownership gatebsd-install gives it.
+ensure_shared_dir() {
+    _dir=$1
+    _owner=$2
+    if [ -d "$_dir" ] && [ ! -L "$_dir" ]; then
+        _dir_mode=$(stat -f '%Lp' "$_dir" 2>/dev/null || printf '%s' 777)
+        case "$_dir_mode" in
+            *[2367][0-7]|*[0-7][2367])
+                log "shared directory must not be group/world writable: $_dir" >&2
+                return 1
+                ;;
+        esac
+        return 0
+    fi
+    [ ! -e "$_dir" ] && [ ! -L "$_dir" ] || { log "unsafe shared directory: $_dir" >&2; return 1; }
+    install -d -o "${_owner%%:*}" -g "${_owner##*:}" -m 0750 "$_dir"
+}
+
+persist_vpn_disabled() {
+    _want=$1
+    _dir=$(dirname "$VPN_DISABLED_FLAG")
+    ensure_shared_dir "$_dir" gatebsd:gatebsd || return 1
+    if [ -e "$VPN_DISABLED_FLAG" ]; then
+        [ -f "$VPN_DISABLED_FLAG" ] && [ ! -L "$VPN_DISABLED_FLAG" ] || return 1
+    fi
+    if [ "$_want" = yes ]; then
+        _tmp=$(mktemp "${VPN_DISABLED_FLAG}.XXXXXX") || return 1
+        trap 'rm -f "${_tmp:-}"' EXIT HUP INT TERM
+        chmod 0640 "$_tmp"
+        mv -f "$_tmp" "$VPN_DISABLED_FLAG"
+        _tmp=
+        trap - EXIT HUP INT TERM
+    else
+        rm -f "$VPN_DISABLED_FLAG"
+    fi
+}
+
+rollback_apply() {
+    _reason=$1
+    log "$_reason; rolling back to WAN"
+    default_via_wan || log "CRITICAL: failed to restore WAN default"
+    # The disabled marker records *operator intent*, and only `down` and `bypass`
+    # may write it. A failed apply is a transient condition -- the peer endpoint
+    # does not resolve yet because PPPoE is still dialling, the handshake has not
+    # landed -- and setting the marker here turned that into "the user switched
+    # the VPN off": the watchdog then skipped its whole VPN section, the panel
+    # reported "VPN disabled by operator", and nothing retried. The marker
+    # survives a reboot, so every boot whose first apply lost the race left the
+    # LAN on the bare WAN until a human intervened. Leave it exactly as it was:
+    # if the VPN was wanted it stays wanted, and the watchdog converges.
+    if [ "$AWG_STARTED" -eq 1 ]; then
+        stop_awg || log "WARNING: failed to stop newly started $VPN_IF"
+    fi
+    return 1
+}
+
+# Tear the running tunnel down and build the next one, as ONE locked operation.
+#
+# Switching a profile is two steps, and until this existed they were two
+# separate operations with a gap between them: the panel ran `awg-quick down`
+# by hand -- taking no gateway lock at all -- and then `gatewayctl apply`, which
+# takes the lock only for its own duration. The watchdog wakes every 10 s, and
+# by the time the panel got to step two the active symlink already pointed at
+# the new profile and the disabled marker was already cleared. So the watchdog
+# saw "the VPN is wanted and the default route is not on it", took the lock
+# first, and applied the new profile itself. The panel's own apply then found
+# `awg0 already up` and its verification gate judged a tunnel it had not built
+# -- which is exactly the confusion the teardown exists to prevent, arriving
+# through a different door.
+#
+# Doing both under the one lock this script already takes closes the gap
+# without inventing a second locking protocol somewhere else.
+cmd_rebuild() {
+    log "=== rebuild: start ==="
+    # The current default points at the VPN interface.  Destroying that
+    # interface first leaves DNS with a default route to nowhere, yet
+    # ensure_awg must resolve a hostname before it can recreate the tunnel.
+    # This happened on the production router during the AWG userspace switch:
+    # the endpoint was healthy, but both the requested rebuild and its
+    # immediate rollback timed out in endpoint_resolvable().  Move to the raw
+    # WAN while the old tunnel is still present; this is transient routing, not
+    # operator intent, and cmd_apply commits the default back to VPN only after
+    # handshake and internet gates pass.
+    default_via_wan || {
+        log "cannot establish a transient WAN default; leaving $VPN_IF intact" >&2
+        return 1
+    }
+    # A tunnel that will not stop is not a reason to refuse to build one: the
+    # apply below reports honestly either way, and refusing here would leave the
+    # box with no tunnel and no attempt to make one.
+    stop_awg || log "WARNING: $VPN_IF did not stop cleanly; building anyway"
+    cmd_apply
+}
+
+cmd_apply() {
+    log "=== apply: start ==="
+    # Each step is guarded with an explicit `return 1` rather than relying on
+    # `set -e` to propagate rollback_apply's status: `||` suppresses `set -e`
+    # for its left operand, so the intent must be stated outright.
+    ensure_awg || { rollback_apply "awg startup failed"; return 1; }
+    route_endpoint_via_wan || { rollback_apply "endpoint routing failed"; return 1; }
+    reconcile_port_forwards || { rollback_apply "port-forward reconcile failed"; return 1; }
+    apply_pf || { rollback_apply "PF reload failed"; return 1; }
+    # Verify the tunnel before, not after, committing the default route to it.
+    vpn_has_handshake || { rollback_apply "no VPN handshake"; return 1; }
+    default_via_vpn || { rollback_apply "VPN default route failed"; return 1; }
+    check_net || { rollback_apply "internet health check failed"; return 1; }
+    persist_vpn_disabled no || { rollback_apply "failed to clear VPN disabled marker"; return 1; }
+    log "=== apply: OK - internet via $VPN_IF ==="
+}
+
+# $1: whether this teardown is the operator saying "keep the VPN off".
+#
+# `service gatewayctl_apply stop` runs on the shutdown path as well as from an
+# operator's hands, and it used to take the same route as an explicit `down`:
+# the disabled marker was written on the way to halt, and the next boot came up
+# with the VPN already declared off. Nothing on the device then retried it.
+# Shutting a router down is not a statement about how it should route once it is
+# back, so rc.d calls `teardown` and only an explicit `down` records intent.
+cmd_down() {
+    _record_intent=${1:-yes}
+    log "=== down (record intent: $_record_intent) ==="
+    _rc=0
+    # If no WAN gateway is available we must still tear the tunnel down. Leaving
+    # the VPN as the default route while stopping here means the next boot
+    # inherits a default route pointing into a dead tunnel, which is not
+    # recoverable from the LAN. A router with no default route is: the watchdog
+    # and gatewayctl can both install one once a WAN gateway appears.
+    if default_via_wan; then
+        :
+    else
+        log "CRITICAL: no WAN gateway; withdrawing the VPN default rather than keeping it"
+        route_op clear-default || log "CRITICAL: failed to withdraw default route"
+        _rc=1
+    fi
+    if [ "$_record_intent" = yes ]; then
+        persist_vpn_disabled yes || {
+            log "CRITICAL: failed to persist disabled marker"
+            _rc=1
+        }
+    fi
+    # Stop the tunnel before removing the endpoint pin: awg-quick down needs to
+    # reach its own routes, and an early unpin leaves a mixed state if it fails.
+    stop_awg || { log "WARNING: failed to stop $VPN_IF"; _rc=1; }
+    unpin_endpoint || log "WARNING: failed to remove endpoint host route"
+    if [ "$_rc" -eq 0 ]; then
+        log "=== down: done ==="
+    else
+        log "=== down: completed with errors ==="
+    fi
+    return "$_rc"
+}
+
+# $1: whether this bypass is the operator saying "keep the VPN off".
+#
+# The emergency exit -- a tunnel that will not carry traffic must not take the
+# household offline -- is reached from two places, and only one of them is a
+# person. Automatic recovery escalates to it as well, and recording that
+# escalation as operator intent turned one bad minute into a permanent state:
+# the marker survives a reboot, every reader honours it, the watchdog skips its
+# whole VPN section, and `recover_internet` then calls any default route
+# "preferred" while the marker is set -- so the panel answered "Internet is
+# working normally" with the VPN off.
+#
+# Measured on the production router, 2026-08-04: `apply` reported OK at
+# 00:01:23, automatic recovery bypassed at 00:01:28 over a health probe taken
+# seconds after the route moved, and the LAN ran in the clear from then on --
+# through a reboot at 02:18 -- until a human looked at it. Recovery's own
+# comment ("the watchdog can restore VPN later") was true of the intent and
+# false of the helper.
+#
+# So: only an operator's own `bypass` records intent. `bypass-transient` leaves
+# the marker exactly as it found it, and the watchdog converges back within
+# VPN_RETRY_INTERVAL -- and if the tunnel really is broken, `apply` proves that
+# for itself and restores the WAN, so the cost is bounded either way.
+cmd_bypass() {
+    _record_intent=${1:-yes}
+    log "=== bypass (record intent: $_record_intent): keeping $VPN_IF up, restoring direct WAN ==="
+    default_via_wan || return 1
+    if [ "$_record_intent" = yes ] && ! persist_vpn_disabled yes; then
+        default_via_vpn || log "CRITICAL: failed to restore VPN default after marker error"
+        return 1
+    fi
+    unpin_endpoint || log "WARNING: failed to remove endpoint host route"
+    log "=== bypass: done ==="
+}
+
+cmd_status() {
+    printf '\n== interfaces ==\n'
+    for iface in "$WAN_IF" "$BACKUP_IF" "$LAN_IF" "$VPN_IF"; do
+        _flags=$(ifconfig "$iface" 2>/dev/null | awk 'NR==1{print $2}')
+        _inet=$(ifconfig "$iface" 2>/dev/null | awk '$1 == "inet" {print $2,$3,$4}')
+        printf '  %-8s flags=%-30s inet=%s\n' "$iface" "${_flags:-(absent)}" "${_inet:-(none)}"
+    done
+    printf '\n== default route ==\n'
+    route -n get default 2>/dev/null | awk '/interface:|gateway:/{printf "  %-12s %s\n",$1,$2}'
+    printf '\n== WAN gateways ==\n'
+    _active=$(active_underlay) || die "cannot read a valid active underlay from $STATE_FILE"
+    printf '  active : %s\n' "$_active"
+    printf '  pppoe  : %s\n' "$(pppoe_gw 2>/dev/null || true)"
+    printf '  backup : %s\n' "$(backup_gw 2>/dev/null || true)"
+    printf '\n== VPN endpoint ==\n'
+    _ep=$(vpn_endpoint_ip 2>/dev/null || true)
+    printf '  %s -> %s\n' "${VPN_ENDPOINT_HOST:-unset}" "${_ep:-(unresolved)}"
+    [ -z "$_ep" ] || route -n get "$_ep" 2>/dev/null | awk '/interface:|gateway:/{printf "  ep %-10s %s\n",$1,$2}'
+    printf '\n== awg peers ==\n'
+    if ifconfig "$VPN_IF" >/dev/null 2>&1; then
+        awg show "$VPN_IF" 2>/dev/null || echo '  (awg show failed)'
+    else
+        printf '  (%s absent)\n' "$VPN_IF"
+    fi
+    printf '\n== internet ==\n'
+    _via=$(route -n get "$CHECK_IP" 2>/dev/null | awk '/interface:/{print $2}')
+    if check_net; then
+        printf '  OK  %s reachable via %s\n' "$CHECK_IP" "${_via:-(?)}"
+    else
+        printf '  FAIL  %s unreachable\n' "$CHECK_IP"
+    fi
+    echo
+}
+
+ACTION=${1:-status}
+
+if [ "$ACTION" = __apply-pf ]; then
+    [ "$(id -u)" -eq 0 ] || die "must run as root"
+    apply_pf_unlocked || die "PF apply failed"
+    exit 0
+fi
+
+case "$ACTION" in
+    apply|up|rebuild|down|teardown|rollback|bypass|bypass-transient|wan|reload|pf)
+        [ "$(id -u)" -eq 0 ] || die "must run as root"
+        if [ "${GATEBSD_GATEWAY_LOCK_HELD:-0}" != 1 ]; then
+            command -v lockf >/dev/null 2>&1 || die "lockf is required"
+            _lock_dir=$(dirname "$LOCK_FILE")
+            ensure_shared_dir "$_lock_dir" root:gatebsd || die "unusable runtime directory: $_lock_dir"
+            if [ -e "$LOCK_FILE" ]; then
+                [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] || die "unsafe gateway lock: $LOCK_FILE"
+            fi
+            # PATH alone does not survive: the child reassigns it from
+            # GATEBSD_PATH's default on its first line, so both must be carried.
+            exec env -i PATH="$PATH" GATEBSD_PATH="$PATH" \
+                GATEBSD_GATEWAY_LOCK_HELD=1 \
+                GATEBSD_GATEWAY_CONF="$CONF" \
+                GATEBSD_GATEWAY_LOCK_FILE="$LOCK_FILE" \
+                GATEBSD_PF_LOCK_FILE="$PF_LOCK_FILE" \
+                GATEBSD_WATCHDOG_STATE="$STATE_FILE" \
+                GATEBSD_VPN_DISABLED_FLAG="$VPN_DISABLED_FLAG" \
+                GATEBSD_ROUTE_HELPER="$ROUTE_HELPER" \
+                GATEBSD_STATE_READER="$STATE_READER" \
+                PING_TIMEOUT="$PING_TIMEOUT" CHECK_IP="$CHECK_IP" \
+                CHECK_TCP_PORT="$CHECK_TCP_PORT" \
+                VPN_HANDSHAKE_WAIT="$VPN_HANDSHAKE_WAIT" \
+                VPN_ENDPOINT_WAIT="$VPN_ENDPOINT_WAIT" \
+                lockf -k -t 5 "$LOCK_FILE" "$0" "$ACTION"
+        fi
+        ;;
+esac
+
+case "$ACTION" in
+    apply|up) cmd_apply ;;
+    rebuild) cmd_rebuild ;;
+    down|rollback) cmd_down yes ;;
+    teardown) cmd_down no ;;
+    bypass|wan) cmd_bypass yes ;;
+    bypass-transient) cmd_bypass no ;;
+    reload|pf) apply_pf || die "PF apply failed" ;;
+    status) cmd_status ;;
+    *) echo 'Usage: gatewayctl {apply|up|rebuild|down|teardown|rollback|bypass|bypass-transient|wan|reload|status}' >&2; exit 2 ;;
+esac

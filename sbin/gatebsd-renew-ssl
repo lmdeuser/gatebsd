@@ -1,0 +1,128 @@
+#!/bin/sh
+# Renew the gateway's DuckDNS/Let's Encrypt certificate without exposing its token.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+CONFIG=${GATEBSD_TLS_CONFIG:-/usr/local/etc/gatebsd/duckdns.conf}
+TLS_DIR=${GATEBSD_TLS_DIR:-/usr/local/etc/ssl/letsencrypt}
+ACME=${GATEBSD_ACME:-/usr/local/sbin/acme.sh}
+ACME_HOME=${GATEBSD_ACME_HOME:-/var/db/acme/.acme.sh}
+OPENSSL=${GATEBSD_OPENSSL:-/usr/bin/openssl}
+NGINX=${GATEBSD_NGINX:-/usr/local/sbin/nginx}
+SERVICE=${GATEBSD_SERVICE:-/usr/sbin/service}
+LOG=${GATEBSD_TLS_LOG:-/var/log/gatebsd-ssl-renew.log}
+LOCK_FILE=${GATEBSD_TLS_LOCK:-/var/run/gatebsd/tls-renew.lock}
+RENEW_WINDOW=2592000
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+fail() { log "ERROR: $*"; printf 'gatebsd-renew-ssl: %s\n' "$*" >&2; exit 1; }
+file_uid() { stat -f '%u' "$1" 2>/dev/null; }
+file_mode() { stat -f '%Lp' "$1" 2>/dev/null; }
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+if [ "${GATEBSD_RENEW_LOCK_HELD:-0}" != 1 ]; then
+    exec lockf -t 0 "$LOCK_FILE" env GATEBSD_RENEW_LOCK_HELD=1 "$0" "$@"
+fi
+
+[ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || fail "missing or unsafe $CONFIG"
+[ "$(file_uid "$CONFIG")" = 0 ] || fail "$CONFIG must be root-owned"
+case "$(file_mode "$CONFIG")" in 400|600|0400|0600) ;; *) fail "$CONFIG must have mode 0600" ;; esac
+# Root-only shell assignments are the configuration format used by the other
+# GateBSD root scripts. The token is exported, never placed in acme's argv.
+. "$CONFIG"
+printf '%s\n' "${GATEBSD_TLS_DOMAIN:-}" \
+    | grep -Eq '^[a-z0-9][a-z0-9-]{0,62}\.duckdns\.org$' \
+    || fail "invalid DuckDNS domain"
+case "${DuckDNS_Token:-}" in ''|*[!A-Za-z0-9-]*) fail "invalid DuckDNS token" ;; esac
+export DuckDNS_Token
+DOMAIN=$GATEBSD_TLS_DOMAIN
+
+[ -x "$ACME" ] || fail "acme.sh is unavailable"
+[ -x "$OPENSSL" ] || fail "openssl is unavailable"
+[ -x "$NGINX" ] || fail "nginx is unavailable"
+[ -x "$SERVICE" ] || fail "service is unavailable"
+if [ -e "$TLS_DIR" ] || [ -L "$TLS_DIR" ]; then
+    [ -d "$TLS_DIR" ] && [ ! -L "$TLS_DIR" ] || fail "unsafe TLS directory"
+else
+    install -d -o root -g wheel -m 0700 "$TLS_DIR"
+fi
+if [ -L "$LOG" ] || { [ -e "$LOG" ] && [ ! -f "$LOG" ]; }; then fail "unsafe log path"; fi
+umask 077
+
+CERT="$TLS_DIR/cert.pem"
+CHAIN="$TLS_DIR/fullchain.pem"
+KEY="$TLS_DIR/privkey.pem"
+if [ -f "$CHAIN" ] && [ ! -L "$CHAIN" ] && \
+    "$OPENSSL" x509 -in "$CHAIN" -noout -checkend "$RENEW_WINDOW" -checkhost "$DOMAIN" >/dev/null 2>&1; then
+    log "certificate for $DOMAIN is not due for renewal"
+    exit 0
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/var/tmp}/gatebsd-tls.XXXXXX") || fail "cannot create work directory"
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+
+log "requesting certificate for $DOMAIN"
+if ! "$ACME" --home "$ACME_HOME" --issue -d "$DOMAIN" --dns dns_duckdns \
+        --keylength ec-256 --server https://acme-v02.api.letsencrypt.org/directory >> "$LOG" 2>&1; then
+    fail "acme.sh issuance failed; the existing certificate is unchanged"
+fi
+if ! "$ACME" --home "$ACME_HOME" --install-cert -d "$DOMAIN" --ecc \
+        --cert-file "$WORK/cert.pem" --key-file "$WORK/privkey.pem" \
+        --fullchain-file "$WORK/fullchain.pem" >> "$LOG" 2>&1; then
+    fail "acme.sh could not export the certificate; the existing certificate is unchanged"
+fi
+for _name in cert.pem fullchain.pem privkey.pem; do
+    [ -f "$WORK/$_name" ] && [ ! -L "$WORK/$_name" ] || fail "missing or unsafe candidate $_name"
+done
+"$OPENSSL" x509 -in "$WORK/fullchain.pem" -noout -checkend 86400 -checkhost "$DOMAIN" >/dev/null 2>&1 \
+    || fail "the candidate is invalid, wrong for $DOMAIN, or expires within 24 hours"
+new_pub=$("$OPENSSL" x509 -in "$WORK/fullchain.pem" -noout -pubkey) || fail "cannot read candidate public key"
+key_pub=$("$OPENSSL" pkey -in "$WORK/privkey.pem" -pubout) || fail "cannot read candidate private key"
+[ "$new_pub" = "$key_pub" ] || fail "candidate certificate does not match its private key"
+
+for _name in cert.pem fullchain.pem privkey.pem; do
+    _target="$TLS_DIR/$_name"
+    if [ -e "$_target" ] || [ -L "$_target" ]; then
+        [ -f "$_target" ] && [ ! -L "$_target" ] || fail "unsafe existing TLS file: $_target"
+        cp -p "$_target" "$WORK/previous-$_name"
+    fi
+done
+
+publish_one() {
+    _source=$1
+    _target=$2
+    _mode=$3
+    _staged="$_target.renew.$$"
+    install -m "$_mode" "$_source" "$_staged" && mv -f "$_staged" "$_target"
+}
+publish_all() {
+    publish_one "$WORK/cert.pem" "$CERT" 0644 && \
+    publish_one "$WORK/fullchain.pem" "$CHAIN" 0644 && \
+    publish_one "$WORK/privkey.pem" "$KEY" 0600
+}
+restore_all() {
+    for _name in cert.pem fullchain.pem privkey.pem; do
+        _target="$TLS_DIR/$_name"
+        if [ -f "$WORK/previous-$_name" ]; then
+            cp -p "$WORK/previous-$_name" "$_target.rollback.$$" && mv -f "$_target.rollback.$$" "$_target" || return 1
+        else
+            rm -f "$_target"
+        fi
+    done
+}
+
+if ! publish_all; then
+    restore_all || true
+    fail "cannot publish the renewed certificate; previous files restored"
+fi
+if ! "$NGINX" -t > "$WORK/nginx.log" 2>&1; then
+    restore_all || true
+    fail "nginx rejected the renewed certificate; previous files restored"
+fi
+if ! "$SERVICE" nginx reload > "$WORK/reload.log" 2>&1; then
+    restore_all || true
+    "$SERVICE" nginx reload >/dev/null 2>&1 || true
+    fail "nginx reload failed; previous files restored"
+fi
+
+log "certificate for $DOMAIN renewed and nginx reloaded"

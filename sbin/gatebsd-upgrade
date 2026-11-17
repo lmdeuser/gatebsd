@@ -1,0 +1,574 @@
+#!/bin/sh
+# Install one verified GateBSD package with a complete package/config/database rollback.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+LOCK_FILE=${GATEBSD_UPGRADE_LOCK:-/var/run/gatebsd/upgrade.lock}
+BACKUP_ROOT=${GATEBSD_UPGRADE_BACKUP_ROOT:-/var/backups/gatebsd}
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+BACKEND=${GATEBSD_BACKEND:-/usr/local/share/gatebsd/webui/backend}
+MAX_PACKAGE_BYTES=${GATEBSD_MAX_PACKAGE_BYTES:-536870912}
+KEEP_BACKUPS=${GATEBSD_UPGRADE_BACKUP_KEEP:-3}
+MIN_FREE_KIB=${GATEBSD_UPGRADE_MIN_FREE_KIB:-1048576}
+# Fixed in production; overridable so the rollback path can be exercised by the
+# regression suite without touching live firewall or routing state. Both
+# defaults are root-only, so this widens no trust boundary.
+PF_CONF=${GATEBSD_UPGRADE_PF_CONF:-/etc/pf.conf}
+GATEWAYCTL=${GATEBSD_UPGRADE_GATEWAYCTL:-/usr/local/sbin/gatewayctl}
+CONFIG_GUARD=${GATEBSD_CONFIG_GUARD:-/usr/local/sbin/gatebsd-config-guard}
+
+fail() { echo "gatebsd-upgrade: $*" >&2; exit 1; }
+usage() { echo "Usage: gatebsd-upgrade /absolute/path/to/gatebsd.pkg" >&2; exit 2; }
+
+safe_private_root() {
+    _root=$1
+    case "$_root" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$_root" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/libexec|/media|/mnt|/proc|/rescue|/root|/sbin|/sys|/tmp|/usr|/usr/local|/var|/var/backups)
+            return 1
+            ;;
+        *[!A-Za-z0-9_./-]*|*//*|*/../*|*/..|*/./*|*/.)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+require_upgrade_space() {
+    _space_dir=$1
+    _need_kib=$2
+    _avail_kib=$(df -Pk "$_space_dir" 2>/dev/null | awk 'NR > 1 {value=$4} END {print value}')
+    case "$_avail_kib" in ''|*[!0-9]*) fail "cannot determine free space on $_space_dir" ;; esac
+    [ "$_avail_kib" -ge $((_need_kib + MIN_FREE_KIB)) ] || \
+        fail "insufficient free space on $_space_dir: need $_need_kib KiB plus $MIN_FREE_KIB KiB reserve, $_avail_kib KiB available"
+}
+
+prune_upgrade_backups() {
+    _current_name=$(basename "$backup")
+    ls "$BACKUP_ROOT" 2>/dev/null |
+        grep -E '^upgrade-[0-9]{8}-[0-9]{6}-[0-9]+$' |
+        sort |
+        awk -v keep="$KEEP_BACKUPS" '{ names[NR] = $0 } END {
+            for (i = 1; i <= NR - keep; i++) print names[i]
+        }' |
+    while IFS= read -r _stale; do
+        [ -n "$_stale" ] || continue
+        [ "$_stale" != "$_current_name" ] || continue
+        _stale_path="${BACKUP_ROOT}/${_stale}"
+        [ -d "$_stale_path" ] && [ ! -L "$_stale_path" ] || continue
+        rm -rf -- "$_stale_path"
+    done
+}
+
+# Create the shared runtime directory if it is missing, and otherwise leave its
+# ownership alone.
+#
+# /var/run/gatebsd holds the agent's unix socket, and the web UI runs as the
+# unprivileged service account, which needs the group's traverse bit to reach
+# it. `install -d -o root -g wheel` re-applies owner, group and mode to a
+# directory that already exists, and this one ran on the delivery path itself:
+# every upgrade re-owned the directory, and the panel was only saved by the
+# service restart at the end of the same run putting the group back. Validate
+# what is there; never re-own it. Full account in sbin/ru-bypass-update.sh.
+ensure_runtime_dir() {
+    _dir=$1
+    if [ -e "$_dir" ] || [ -L "$_dir" ]; then
+        [ -d "$_dir" ] && [ ! -L "$_dir" ] || fail "unsafe runtime directory: $_dir"
+        _dir_uid=$(stat -f '%u' "$_dir" 2>/dev/null || printf '%s' -1)
+        _dir_mode=$(stat -f '%Lp' "$_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_dir_uid" = 0 ] || fail "runtime directory must be root-owned: $_dir"
+        case "$_dir_mode" in
+            *[2367][0-7]|*[0-7][2367]) fail "runtime directory must not be group/world writable: $_dir" ;;
+        esac
+    else
+        install -d -o root -g "${GATEBSD_SERVICE_GROUP:-gatebsd}" -m 0750 "$_dir"
+    fi
+}
+
+REQUIRE_REPO_HASH=0
+if [ "${GATEBSD_REQUIRE_REPO_HASH:-0}" = 1 ]; then
+    REQUIRE_REPO_HASH=1
+fi
+ALLOW_DOWNGRADE=0
+if [ "${GATEBSD_ALLOW_DOWNGRADE:-0}" = 1 ]; then
+    ALLOW_DOWNGRADE=1
+fi
+
+ensure_runtime_dir "$(dirname "$LOCK_FILE")"
+if [ "${GATEBSD_UPGRADE_LOCK_HELD:-0}" != 1 ]; then
+    exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_UPGRADE_LOCK_HELD=1 \
+        GATEBSD_UPGRADE_LOCK="$LOCK_FILE" \
+        GATEBSD_UPGRADE_BACKUP_ROOT="$BACKUP_ROOT" \
+        GATEBSD_PYTHON_LAUNCHER="$PYTHON_LAUNCHER" \
+        GATEBSD_BACKEND="$BACKEND" \
+        GATEBSD_MAX_PACKAGE_BYTES="$MAX_PACKAGE_BYTES" \
+        GATEBSD_UPGRADE_BACKUP_KEEP="$KEEP_BACKUPS" \
+        GATEBSD_UPGRADE_MIN_FREE_KIB="$MIN_FREE_KIB" \
+        GATEBSD_UPGRADE_PF_CONF="$PF_CONF" \
+        GATEBSD_UPGRADE_GATEWAYCTL="$GATEWAYCTL" \
+        GATEBSD_REQUIRE_REPO_HASH="$REQUIRE_REPO_HASH" \
+        GATEBSD_ALLOW_DOWNGRADE="$ALLOW_DOWNGRADE" \
+        lockf -t 0 "$LOCK_FILE" "$0" "$@"
+fi
+if [ "${GATEBSD_UPGRADE_CONFIG_LOCKS_HELD:-0}" != 1 ]; then
+    [ -x "$PYTHON_LAUNCHER" ] || fail "Python launcher is unavailable"
+    exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_UPGRADE_LOCK_HELD=1 GATEBSD_UPGRADE_CONFIG_LOCKS_HELD=1 \
+        GATEBSD_UPGRADE_LOCK="$LOCK_FILE" GATEBSD_UPGRADE_BACKUP_ROOT="$BACKUP_ROOT" \
+        GATEBSD_PYTHON_LAUNCHER="$PYTHON_LAUNCHER" GATEBSD_BACKEND="$BACKEND" \
+        GATEBSD_MAX_PACKAGE_BYTES="$MAX_PACKAGE_BYTES" PYTHONPATH="$BACKEND" \
+        GATEBSD_UPGRADE_BACKUP_KEEP="$KEEP_BACKUPS" \
+        GATEBSD_UPGRADE_MIN_FREE_KIB="$MIN_FREE_KIB" \
+        GATEBSD_UPGRADE_PF_CONF="$PF_CONF" GATEBSD_UPGRADE_GATEWAYCTL="$GATEWAYCTL" \
+        GATEBSD_REQUIRE_REPO_HASH="$REQUIRE_REPO_HASH" \
+        GATEBSD_ALLOW_DOWNGRADE="$ALLOW_DOWNGRADE" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.lockrun \
+        --lock /etc/pf.conf.gatebsd.lock \
+        --lock /etc/rc.conf.gatebsd.lock \
+        --lock /usr/local/etc/dhcpd.conf.lock \
+        --lock /usr/local/etc/unbound/unbound.conf.gatebsd.lock \
+        --lock /usr/local/etc/amnezia/.gatebsd-profiles.lock \
+        --lock /usr/local/etc/amnezia/ru_bypass.table.lock \
+        --lock /usr/local/etc/nut/.gatebsd-config.lock \
+        -- "$0" "$@"
+fi
+TARGET=${1:-}
+[ "$#" -eq 1 ] || usage
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+case "$TARGET" in /*) ;; *) usage ;; esac
+[ -f "$TARGET" ] && [ ! -L "$TARGET" ] || fail "target must be a regular non-symlink package"
+_target_links=$(stat -c '%h' "$TARGET" 2>/dev/null || stat -f '%l' "$TARGET" 2>/dev/null || printf '%s' 1)
+case "$_target_links" in ''|*[!0-9]*) _target_links=1 ;; esac
+[ "$_target_links" -eq 1 ] || fail "target package must not have hardlinks"
+_target_uid=$(stat -f '%u' "$TARGET" 2>/dev/null || printf '%s' -1)
+_target_mode=$(stat -f '%Lp' "$TARGET" 2>/dev/null || printf '%s' 777)
+[ "$_target_uid" -eq 0 ] || fail "target package must be owned by root"
+case "$_target_mode" in
+    *[2367][0-7]|*[0-7][2367]) fail "target package must not be group/world writable" ;;
+esac
+case "$MAX_PACKAGE_BYTES" in ''|*[!0-9]*) fail "invalid package size limit" ;; esac
+case "$KEEP_BACKUPS:$MIN_FREE_KIB" in ''|*[!0-9:]*|:*|*:) fail "invalid upgrade backup limits" ;; esac
+[ "$KEEP_BACKUPS" -ge 1 ] || fail "upgrade backup retention must keep at least one copy"
+_target_size=$(stat -f '%z' "$TARGET" 2>/dev/null || printf '%s' 0)
+[ "$_target_size" -gt 0 ] && [ "$_target_size" -le "$MAX_PACKAGE_BYTES" ] \
+    || fail "package size is outside the allowed range"
+_target_hash=$(sha256 -q "$TARGET" 2>/dev/null) || fail "cannot hash target package"
+require_upgrade_space "$(dirname "$LOCK_FILE")" "$(((_target_size + 1023) / 1024))"
+
+# Next to the lock, not at a second hardcoded path. In production both resolve
+# to /var/run/gatebsd, so nothing moves; the difference is that overriding
+# GATEBSD_UPGRADE_LOCK now moves the whole runtime footprint, instead of moving
+# the lock and leaving a half-gigabyte package copy behind in the live
+# directory. The regression suite depends on that: without it the only way to
+# exercise this script is to let it write into the running system's /var/run.
+WORKDIR=$(mktemp -d "$(dirname "$LOCK_FILE")/upgrade.XXXXXX") \
+    || fail "cannot allocate work directory"
+ROLLBACK_DB_TMP=
+cleanup() {
+    [ -z "$ROLLBACK_DB_TMP" ] || rm -f "$ROLLBACK_DB_TMP"
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT HUP INT TERM
+CANDIDATE="$WORKDIR/candidate.pkg"
+cp -p "$TARGET" "$CANDIDATE"
+chmod 0600 "$CANDIDATE"
+[ "$(stat -f '%z' "$TARGET" 2>/dev/null || printf '%s' 0)" = "$_target_size" ] \
+    || fail "target package changed while copying"
+[ "$(stat -f '%u' "$TARGET" 2>/dev/null || printf '%s' -1)" = "$_target_uid" ] \
+    || fail "target package ownership changed while copying"
+[ "$(stat -f '%Lp' "$TARGET" 2>/dev/null || printf '%s' 777)" = "$_target_mode" ] \
+    || fail "target package mode changed while copying"
+[ "$(stat -f '%z' "$CANDIDATE")" = "$_target_size" ] || fail "package copy is incomplete"
+[ "$(sha256 -q "$TARGET" 2>/dev/null || true)" = "$_target_hash" ] \
+    || fail "target package changed while copying"
+[ "$(sha256 -q "$CANDIDATE" 2>/dev/null || true)" = "$_target_hash" ] \
+    || fail "private package copy does not match the target"
+
+# Both package readers must accept the immutable private copy.
+pkg info -F "$CANDIDATE" >/dev/null 2>&1 || fail "pkg info rejected the package"
+target_name=$(pkg query -F "$CANDIDATE" '%n' 2>/dev/null || true)
+target_version=$(pkg query -F "$CANDIDATE" '%v' 2>/dev/null || true)
+target_origin=$(pkg query -F "$CANDIDATE" '%o' 2>/dev/null || true)
+target_prefix=$(pkg query -F "$CANDIDATE" '%p' 2>/dev/null || true)
+[ "$target_name" = gatebsd ] || fail "package name is not gatebsd"
+[ "$target_origin" = local/gatebsd ] || fail "package origin is not local/gatebsd"
+[ "$target_prefix" = /usr/local ] || fail "package prefix is not /usr/local"
+case "$target_version" in
+    ''|*[!A-Za-z0-9+_,.-]*|[.-]*|*..*) fail "unsafe package version metadata" ;;
+esac
+
+old_version=$(pkg query '%v' gatebsd 2>/dev/null || true)
+[ -n "$old_version" ] || fail "an installed GateBSD package is required for rollback"
+case "$old_version" in ''|*[!A-Za-z0-9+_,.-]*) fail "installed package has unsafe version metadata" ;; esac
+
+if [ "$ALLOW_DOWNGRADE" != 1 ]; then
+    _ver_cmp=$(pkg version -t "$target_version" "$old_version" 2>/dev/null || true)
+    if [ "$_ver_cmp" = "<" ]; then
+        fail "refusing package downgrade ($target_version < $old_version); set GATEBSD_ALLOW_DOWNGRADE=1 to override"
+    fi
+fi
+
+# FreeBSD pkg 2.9 removed %X from rquery; prefixing %{%%} emits a literal `%`
+# before `%v %u`, yielding `version version$zbase32_blake2b` that matches `pkg checksum`.
+_repo_cksum=$(pkg rquery -U -r gatebsd-releases '%{%%}%v %u' gatebsd 2>/dev/null | sed 's/^%%{%}//' | awk -v tv="$target_version" '$1 == tv { print $2; exit }' || true)
+case "$_repo_cksum" in
+    '')
+        if [ "$REQUIRE_REPO_HASH" = 1 ]; then
+            fail "cannot verify target package checksum against gatebsd-releases repository"
+        fi
+        ;;
+    [0-9]\$*[A-Za-z0-9])
+        case "$_repo_cksum" in
+            *[!A-Za-z0-9\$]*) fail "repository checksum metadata is invalid" ;;
+        esac
+        _cand_cksum=$(pkg checksum "$CANDIDATE" 2>/dev/null | awk '{print $1; exit}' || true)
+        [ -n "$_cand_cksum" ] && [ "$_repo_cksum" = "$_cand_cksum" ] \
+            || fail "target package checksum does not match gatebsd-releases repository metadata"
+        ;;
+    *)
+        fail "repository checksum metadata is invalid"
+        ;;
+esac
+
+# Catch dormant corruption before pkg gets a chance to restart a daemon into
+# it. Status 1 means the guard repaired from known-good and is safe to proceed;
+# status 2 means at least one service cannot start and the live system must be
+# left untouched.
+if [ -x "$CONFIG_GUARD" ] && [ ! -L "$CONFIG_GUARD" ]; then
+    _guard_status=0
+    "$CONFIG_GUARD" || _guard_status=$?
+    [ "$_guard_status" -le 1 ] || fail "configuration guard rejected the upgrade"
+fi
+
+safe_private_root "$BACKUP_ROOT" || fail "unsafe backup root: $BACKUP_ROOT"
+if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
+    [ -d "$BACKUP_ROOT" ] && [ ! -L "$BACKUP_ROOT" ] || fail "unsafe backup root: $BACKUP_ROOT"
+fi
+install -d -o root -g wheel -m 0700 "$BACKUP_ROOT"
+require_upgrade_space "$BACKUP_ROOT" 0
+stamp=$(date '+%Y%m%d-%H%M%S')
+backup="$BACKUP_ROOT/upgrade-${stamp}-$$"
+mkdir -m 0700 "$backup" || fail "cannot create rollback directory"
+printf 'old_version=%s\ntarget_version=%s\n' "$old_version" "$target_version" > "$backup/metadata"
+chmod 0600 "$backup/metadata"
+
+echo "Saving rollback package and state to $backup"
+pkg create -o "$backup" gatebsd >/dev/null || fail "cannot create rollback package"
+old_pkg=
+old_pkg_count=0
+for _pkg in "$backup"/gatebsd-*.pkg; do
+    [ -f "$_pkg" ] && [ ! -L "$_pkg" ] || continue
+    old_pkg=$_pkg
+    old_pkg_count=$((old_pkg_count + 1))
+done
+[ "$old_pkg_count" -eq 1 ] || fail "rollback package selection is ambiguous"
+pkg info -F "$old_pkg" >/dev/null 2>&1 || fail "rollback package is unreadable"
+[ "$(pkg query -F "$old_pkg" '%n')" = gatebsd ] || fail "rollback package has wrong name"
+[ "$(pkg query -F "$old_pkg" '%v')" = "$old_version" ] || fail "rollback package version mismatch"
+
+CONFIG_LIST="$WORKDIR/config.list"
+: > "$CONFIG_LIST"
+for _path in \
+    /usr/local/etc/gatebsd \
+    /usr/local/etc/amnezia \
+    /usr/local/etc/nut \
+    /usr/local/etc/nginx/conf.d/gatebsd.conf \
+    /usr/local/etc/unbound/unbound.conf \
+    /usr/local/etc/unbound/adblock.conf \
+    /usr/local/etc/unbound/split-dns.conf \
+    /usr/local/etc/dhcpd.conf \
+    /usr/local/etc/sudoers \
+    /usr/local/etc/sudoers.d \
+    /etc/ssh/sshd_config \
+    /etc/ssh/sshd_config.d \
+    /etc/pf.conf \
+    /etc/rc.conf; do
+    [ -e "$_path" ] || [ -L "$_path" ] || continue
+    [ ! -L "$_path" ] || fail "refusing symlink configuration source: $_path"
+    if [ -d "$_path" ]; then
+        if find "$_path" -xdev \( -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q .; then
+            fail "configuration tree contains a special file: $_path"
+        fi
+        find "$_path" -xdev -type l -print | while IFS= read -r _link; do
+            [ "$_link" = /usr/local/etc/amnezia/awg0.conf ] \
+                || fail "configuration tree contains an unmanaged symlink: $_link"
+            _resolved=$(realpath "$_link" 2>/dev/null || true)
+            case "$_resolved" in
+                /usr/local/etc/amnezia/*.conf) ;;
+                *) fail "active Amnezia profile points outside its managed directory" ;;
+            esac
+            [ -f "$_resolved" ] && [ ! -L "$_resolved" ] \
+                || fail "active Amnezia profile target is not a regular file"
+            [ "$(dirname "$_resolved")" = /usr/local/etc/amnezia ] \
+                || fail "active Amnezia profile target is nested outside the managed root"
+        done
+    elif [ ! -f "$_path" ]; then
+        fail "configuration source is not a regular file or directory: $_path"
+    fi
+    printf '%s\n' "${_path#/}" >> "$CONFIG_LIST"
+done
+if [ -s "$CONFIG_LIST" ]; then
+    config_kib=$(while IFS= read -r _relative; do du -sk "/$_relative"; done < "$CONFIG_LIST" | awk '{sum += $1} END {print sum + 0}')
+    [ "$config_kib" -le 524288 ] || fail "configuration snapshot exceeds 512 MiB"
+    require_upgrade_space "$BACKUP_ROOT" "$config_kib"
+    tar -cpf "$backup/config.tar" -C / -T "$CONFIG_LIST" || fail "cannot archive current configuration"
+    chmod 0600 "$backup/config.tar"
+    tar -tf "$backup/config.tar" >/dev/null || fail "configuration rollback archive is unreadable"
+fi
+if [ -f /var/db/gatebsd/state.db ] && [ ! -L /var/db/gatebsd/state.db ]; then
+    env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 PYTHONPATH="$BACKEND" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.storage --backup "$backup/state.db" >/dev/null \
+        || fail "cannot create consistent database backup"
+fi
+
+service_was_running() { service "$1" onestatus >/dev/null 2>&1; }
+GATEBSD_WAS_RUNNING=0; FAILOVER_WAS_RUNNING=0; NGINX_WAS_RUNNING=0
+NUT_WAS_RUNNING=0; UPSMON_WAS_RUNNING=0; REVERSE_SSH_WAS_RUNNING=0
+service_was_running gatebsd && GATEBSD_WAS_RUNNING=1 || true
+service_was_running gatebsd_failover && FAILOVER_WAS_RUNNING=1 || true
+service_was_running nginx && NGINX_WAS_RUNNING=1 || true
+service_was_running nut && NUT_WAS_RUNNING=1 || true
+service_was_running nut_upsmon && UPSMON_WAS_RUNNING=1 || true
+service_was_running gatebsd_reverse_ssh && REVERSE_SSH_WAS_RUNNING=1 || true
+
+# Attempt every service, then report. Returning at the first failure left the
+# remaining services stopped, and on the rollback path that means the failover
+# watchdog stays down after a failed nginx restart -- no WAN failover, no VPN
+# recovery, on the site's only uplink.
+restart_previously_running() {
+    _service_failures=
+    if [ "$NGINX_WAS_RUNNING" -eq 1 ] && ! service nginx restart; then
+        _service_failures="${_service_failures} nginx"
+    fi
+    if [ "$GATEBSD_WAS_RUNNING" -eq 1 ] && ! service gatebsd restart; then
+        _service_failures="${_service_failures} gatebsd"
+    fi
+    if [ "$FAILOVER_WAS_RUNNING" -eq 1 ] && ! service gatebsd_failover restart; then
+        _service_failures="${_service_failures} gatebsd_failover"
+    fi
+    if [ "$REVERSE_SSH_WAS_RUNNING" -eq 1 ] && ! service gatebsd_reverse_ssh restart; then
+        _service_failures="${_service_failures} gatebsd_reverse_ssh"
+    fi
+    if [ "$NUT_WAS_RUNNING" -eq 1 ] && ! service nut onestatus >/dev/null 2>&1 \
+            && ! service nut restart; then
+        _service_failures="${_service_failures} nut"
+    fi
+    if [ "$UPSMON_WAS_RUNNING" -eq 1 ] && ! service nut_upsmon onestatus >/dev/null 2>&1 \
+            && ! service nut_upsmon restart; then
+        _service_failures="${_service_failures} nut_upsmon"
+    fi
+    [ -z "$_service_failures" ] || {
+        echo "failed to restart:${_service_failures}" >&2
+        return 1
+    }
+}
+
+ui_port() {
+    _port=8080
+    if [ -r /usr/local/etc/gatebsd/gatebsd.conf ] && [ -f /usr/local/etc/gatebsd/gatebsd.conf ] \
+            && [ ! -L /usr/local/etc/gatebsd/gatebsd.conf ]; then
+        _value=$(awk -F= '
+            /^[[:space:]]*gatebsd_port[[:space:]]*=/ {
+                v=$2; gsub(/[[:space:]"\047]/, "", v); print v; exit
+            }
+        ' /usr/local/etc/gatebsd/gatebsd.conf)
+        case "$_value" in ''|*[!0-9]*) ;; *) [ "$_value" -le 65535 ] && _port=$_value ;; esac
+    fi
+    printf '%s\n' "$_port"
+}
+
+health_gate() {
+    expected_version=$1
+    [ "$(pkg query '%v' gatebsd 2>/dev/null || true)" = "$expected_version" ] || return 1
+    [ -x "$PYTHON_LAUNCHER" ] || return 1
+    env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 PYTHONPATH="$BACKEND" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.storage >/dev/null 2>&1 || return 1
+    if [ "$GATEBSD_WAS_RUNNING" -eq 1 ]; then
+        service gatebsd onestatus >/dev/null 2>&1 || return 1
+        _port=$(ui_port)
+        fetch -T 10 -qo /dev/null "http://127.0.0.1:${_port}/api/auth/status" >/dev/null 2>&1 \
+            || fetch --no-verify-peer --no-verify-hostname -T 10 -qo /dev/null \
+                "https://127.0.0.1:${_port}/api/auth/status" >/dev/null 2>&1 \
+            || return 1
+    fi
+    [ "$FAILOVER_WAS_RUNNING" -eq 0 ] || service gatebsd_failover onestatus >/dev/null 2>&1 || return 1
+    [ "$REVERSE_SSH_WAS_RUNNING" -eq 0 ] || service gatebsd_reverse_ssh onestatus >/dev/null 2>&1 || return 1
+    [ "$NGINX_WAS_RUNNING" -eq 0 ] || service nginx onestatus >/dev/null 2>&1 || return 1
+    [ "$NUT_WAS_RUNNING" -eq 0 ] || service nut onestatus >/dev/null 2>&1 || return 1
+    [ "$UPSMON_WAS_RUNNING" -eq 0 ] || service nut_upsmon onestatus >/dev/null 2>&1 || return 1
+    if [ "$NUT_WAS_RUNNING" -eq 1 ]; then
+        _ups_names=$(upsc -l localhost 2>/dev/null || true)
+        [ -n "$_ups_names" ] || return 1
+        _ups_name=$(printf '%s\n' "$_ups_names" | sed -n '1p')
+        case "$_ups_name" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+        upsc "${_ups_name}@localhost" ups.status >/dev/null 2>&1 || return 1
+    fi
+    if pfctl -s info >/dev/null 2>&1; then
+        pfctl -nf /etc/pf.conf >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+restore_database() {
+    [ -f "$backup/state.db" ] || return 0
+    [ ! -L /var/db/gatebsd ] || return 1
+    [ ! -L /var/db/gatebsd/state.db ] || return 1
+    install -d -o gatebsd -g gatebsd -m 0750 /var/db/gatebsd
+    ROLLBACK_DB_TMP=$(mktemp /var/db/gatebsd/.state.db.rollback.XXXXXX) || return 1
+    if ! install -o gatebsd -g gatebsd -m 0640 "$backup/state.db" "$ROLLBACK_DB_TMP"; then
+        rm -f "$ROLLBACK_DB_TMP"; ROLLBACK_DB_TMP=; return 1
+    fi
+    if ! mv -f "$ROLLBACK_DB_TMP" /var/db/gatebsd/state.db; then
+        rm -f "$ROLLBACK_DB_TMP"; ROLLBACK_DB_TMP=; return 1
+    fi
+    ROLLBACK_DB_TMP=
+    rm -f /var/db/gatebsd/state.db-wal /var/db/gatebsd/state.db-shm
+}
+
+# Last-resort connectivity restore.
+#
+# Every rollback step above can fail, and the one outcome that must never be
+# left behind is a router with no route off-site: this box is the site's only
+# uplink and there is no out-of-band access. Reload the firewall from whatever
+# ruleset is now on disk, put PPPoE back up and re-establish a default route,
+# reporting -- but not aborting on -- each failure.
+restore_networking() {
+    _restored=0
+    if [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ]; then
+        if pfctl -nf "$PF_CONF" >/dev/null 2>&1; then
+            pfctl -f "$PF_CONF" >/dev/null 2>&1 \
+                || echo "CRITICAL: cannot load $PF_CONF" >&2
+        else
+            # A ruleset that does not parse would leave pf enforcing whatever is
+            # loaded now. Disabling pf is the lesser evil: it fails open to a
+            # reachable router rather than closed to an unreachable one.
+            echo "CRITICAL: $PF_CONF does not parse; disabling pf to stay reachable" >&2
+            pfctl -d >/dev/null 2>&1 || true
+        fi
+    fi
+    service mpd5 onestatus >/dev/null 2>&1 || service mpd5 restart >/dev/null 2>&1 || true
+    # gatewayctl owns the default route and takes its own lock; it is the only
+    # supported way to reinstate one. Bound the wait so rollback still returns.
+    # timeout(1) is in FreeBSD base (/usr/bin/timeout); degrade rather than skip
+    # the recovery if it is somehow unavailable.
+    if command -v timeout >/dev/null 2>&1; then
+        _bound="timeout"
+    else
+        _bound=""
+    fi
+    if [ -x "$GATEWAYCTL" ]; then
+        if ${_bound:+$_bound 120} "$GATEWAYCTL" apply >/dev/null 2>&1; then
+            _restored=1
+        elif ${_bound:+$_bound 60} "$GATEWAYCTL" bypass-transient >/dev/null 2>&1; then
+            echo "WARNING: VPN could not be restored; the raw WAN default is active" >&2
+            _restored=1
+        fi
+    fi
+    if [ "$_restored" -eq 0 ]; then
+        route -n get default >/dev/null 2>&1 && _restored=1
+    fi
+    [ "$_restored" -eq 1 ] || echo "CRITICAL: no default route could be restored" >&2
+    return 0
+}
+
+# Every step runs, regardless of earlier failures.
+#
+# The previous implementation returned at the first failing step. A rollback
+# that stops after `pkg add` leaves the new configuration tree on disk against
+# the old package, GateBSD and the failover watchdog stopped, and no default
+# route -- the exact state from which nothing can recover remotely. Partial
+# recovery is strictly better than an early return, so failures are recorded
+# and the remaining steps still execute.
+rollback() {
+    echo "Upgrade failed; restoring GateBSD $old_version" >&2
+    _failed=
+    service gatebsd stop >/dev/null 2>&1 || true
+    pkg add -f "$old_pkg" || _failed="${_failed} package"
+    if [ -f "$backup/config.tar" ]; then
+        tar -xpf "$backup/config.tar" -C / || _failed="${_failed} configuration"
+    fi
+    restore_database || _failed="${_failed} database"
+    restart_previously_running || _failed="${_failed} services"
+    if [ -n "$_failed" ]; then
+        echo "CRITICAL: rollback could not restore:${_failed}" >&2
+        restore_networking
+        return 1
+    fi
+    if health_gate "$old_version"; then
+        return 0
+    fi
+    echo "CRITICAL: the restored version did not pass the health gate" >&2
+    restore_networking
+    return 1
+}
+
+target_deps=$(pkg query -F "$CANDIDATE" '%dn' 2>/dev/null | sort -u)
+missing_deps=
+for dep in $target_deps; do
+    case "$dep" in ''|*[!A-Za-z0-9+_.-]*) fail "unsafe dependency name in package metadata: $dep" ;; esac
+    if ! pkg query -e "%n = \"$dep\"" '%n' 2>/dev/null | grep -qx "$dep"; then
+        missing_deps="$missing_deps $dep"
+    fi
+done
+if [ -n "$missing_deps" ]; then
+    echo "Installing missing GateBSD dependencies:$missing_deps"
+    pkg update || fail "cannot update package repository metadata"
+    # Names are restricted above to package-token characters without whitespace.
+    # shellcheck disable=SC2086
+    pkg install -y $missing_deps || fail "cannot install GateBSD dependencies"
+fi
+
+echo "Installing GateBSD $target_version"
+if [ "$GATEBSD_WAS_RUNNING" -eq 1 ] && ! service gatebsd stop >/dev/null 2>&1; then
+    service gatebsd start >/dev/null 2>&1 || true
+    fail "cannot stop GateBSD before upgrade"
+fi
+if ! pkg add -f "$CANDIDATE"; then
+    rollback || { echo "CRITICAL: package rollback failed; artifacts remain at $backup" >&2; exit 2; }
+    exit 1
+fi
+if ! restart_previously_running || ! health_gate "$target_version"; then
+    rollback || { echo "CRITICAL: health rollback failed; artifacts remain at $backup" >&2; exit 2; }
+    echo "Upgrade rolled back; previous version is healthy" >&2
+    exit 1
+fi
+
+echo "GateBSD $target_version upgrade completed and passed health gate"
+echo "Rollback artifacts: $backup"
+prune_upgrade_backups
+
+# Converge the DNS blocklist with what this package brought.
+#
+# Installing a package that changes etc/gatebsd/adblock-extra does not rebuild
+# the generated /usr/local/etc/unbound/adblock.conf: the resolver keeps serving
+# the previous build until the six-hourly cron fires. Confirmed on the router
+# with 2.9.45 and 2.9.47 -- the new names sat on the device, absent from the
+# resolver, and a customer would have waited up to six hours looking at a
+# product that had visibly not changed.
+#
+# Placed after the health gate on purpose. This is convergence, not part of the
+# upgrade: a failure here must never roll back a version that is otherwise
+# healthy, and cron will retry within six hours either way. It is reported
+# rather than swallowed -- a silent failure here means the device quietly stops
+# following its own blocklist.
+#
+# --if-changed keeps an unchanged extras file from re-downloading 19 MB and
+# spending a minute of CPU on every upgrade. GATEBSD_ADBLOCK_LOCK_HELD says
+# this process already holds the unbound config lock -- it does, from the
+# lockrun re-exec above -- and without it the updater would block forever
+# waiting for a lock held by its own parent.
+ADBLOCK_UPDATE=${GATEBSD_ADBLOCK_UPDATE:-/usr/local/sbin/gatebsd-adblock-update.sh}
+if [ -x "$ADBLOCK_UPDATE" ]; then
+    if GATEBSD_ADBLOCK_LOCK_HELD=1 "$ADBLOCK_UPDATE" --if-changed; then
+        :
+    else
+        echo "WARNING: the blocklist could not be rebuilt after the upgrade;" \
+             "the previous list stays in service and cron will retry" >&2
+    fi
+else
+    echo "WARNING: blocklist updater not found at $ADBLOCK_UPDATE" >&2
+fi

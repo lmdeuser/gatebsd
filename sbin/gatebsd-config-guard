@@ -1,0 +1,334 @@
+#!/bin/sh
+# Keep the router's service configurations startable.
+#
+# The failure this exists for is not a config that is wrong, but a config that
+# is wrong *and dormant*. A running daemon holds its configuration in memory, so
+# a file corrupted underneath it changes nothing until something restarts the
+# service -- and the thing that restarts services is an upgrade. Observed on the
+# production router: two cron-registered copies of the adblock updater wrote
+# /usr/local/etc/unbound/adblock.conf concurrently, `unbound-checkconf` rejected
+# the result, and unbound kept serving for eight days from the list it had
+# loaded before. The next restart would have taken DNS down with no way back,
+# and it would have looked like the upgrade broke it.
+#
+# So: validate every configuration whose service has a native checker, keep the
+# last copy that validated, and put it back when the live one stops validating.
+# Include files are covered for free -- the checkers follow includes, which is
+# exactly how the adblock corruption surfaced.
+#
+# Exit status:
+#   0  every configuration validates
+#   1  at least one was repaired from its last known-good copy
+#   2  at least one is broken and could not be repaired
+#
+# On status 2 the last line of stdout is machine-readable:
+#
+#   UNSTARTABLE: unbound nginx
+#
+# It names *services*, not files, because that is what a caller decides about.
+# Naming files instead would force every caller to carry its own copy of the
+# path defaults, and a caller that got one wrong would silently supervise a
+# service the guard had already condemned.
+#
+# Never restarts anything. Deciding when to restart a service on the site's only
+# uplink belongs to the caller -- but a caller that restarts a service listed
+# here is walking into the outage this script exists to prevent.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+
+PF_CONF=${GATEBSD_PF_CONF:-/etc/pf.conf}
+DHCPD_CONF=${GATEBSD_DHCPD_CONF:-/usr/local/etc/dhcpd.conf}
+UNBOUND_CONF=${GATEBSD_UNBOUND_CONF:-/usr/local/etc/unbound/unbound.conf}
+NGINX_CONF=${GATEBSD_NGINX_CONF:-/usr/local/etc/nginx/nginx.conf}
+GOOD_DIR=${GATEBSD_KNOWN_GOOD_DIR:-/var/db/gatebsd-system/known-good}
+UPS_BOOTSTRAP=${GATEBSD_UPS_BOOTSTRAP:-/usr/local/sbin/gatebsd-ups-bootstrap}
+
+REPAIRED=0
+BROKEN=0
+UNSTARTABLE=''
+
+log() {
+    logger -t gatebsd-config-guard -- "$*" 2>/dev/null || true
+    printf '%s\n' "$*"
+}
+
+# Each checker is given the file to test as its final argument. `pfctl -nf` and
+# friends parse without loading, so running them costs nothing and changes
+# nothing.
+checker_for() {
+    case "$1" in
+        "$PF_CONF")      printf '%s' 'pfctl -nf' ;;
+        "$DHCPD_CONF")   printf '%s' 'dhcpd -q -t -cf' ;;
+        "$UNBOUND_CONF") printf '%s' 'unbound-checkconf' ;;
+        "$NGINX_CONF")   printf '%s' 'nginx -t -c' ;;
+        *)               return 1 ;;
+    esac
+}
+
+# The service a file belongs to, for the UNSTARTABLE line. `pf` is included for
+# completeness even though nothing restarts it here: leaving it out would make
+# the list quietly mean "the services we happen to supervise" instead of "the
+# services whose configuration will not start".
+service_for() {
+    case "$1" in
+        "$PF_CONF")      printf '%s' 'pf' ;;
+        "$DHCPD_CONF")   printf '%s' 'dhcpd' ;;
+        "$UNBOUND_CONF") printf '%s' 'unbound' ;;
+        "$NGINX_CONF")   printf '%s' 'nginx' ;;
+        *)               return 1 ;;
+    esac
+}
+
+condemn() {
+    _svc=$(service_for "$1") || return 0
+    case " $UNSTARTABLE " in
+        *" $_svc "*) ;;
+        *) UNSTARTABLE="$UNSTARTABLE $_svc" ;;
+    esac
+}
+
+validates() {
+    _file=$1
+    _checker=$(checker_for "$_file") || return 0
+    # A missing checker binary must not be read as a broken config: the service
+    # may simply not be installed on this box.
+    command -v "${_checker%% *}" >/dev/null 2>&1 || return 0
+    # shellcheck disable=SC2086 -- the checker is one of the fixed strings above.
+    $_checker "$_file" >/dev/null 2>&1
+}
+
+slug_for() {
+    printf '%s' "$1" | tr '/' '_'
+}
+
+good_copy_for() {
+    printf '%s/%s' "$GOOD_DIR" "$(slug_for "$1")"
+}
+
+includes_dir_for() {
+    printf '%s/includes/%s' "$GOOD_DIR" "$(slug_for "$1")"
+}
+
+companion_includes_for() {
+    _parent=$1
+    _dir=$(dirname "$_parent")
+    case "$_parent" in
+        "$UNBOUND_CONF")
+            for _cand in "$_dir"/*.conf "$_dir"/conf.d/*.conf; do
+                [ "$_cand" != "$_parent" ] || continue
+                [ -f "$_cand" ] && [ ! -L "$_cand" ] || continue
+                printf '%s\n' "$_cand"
+            done
+            ;;
+        "$NGINX_CONF")
+            for _cand in "$_dir"/conf.d/*.conf "$_dir"/*.conf; do
+                [ "$_cand" != "$_parent" ] || continue
+                [ -f "$_cand" ] && [ ! -L "$_cand" ] || continue
+                printf '%s\n' "$_cand"
+            done
+            ;;
+    esac
+}
+
+ensure_private_dir() {
+    _pdir=$1
+    [ -d "$_pdir" ] || mkdir -p "$_pdir" 2>/dev/null || return 1
+    chmod 0700 "$_pdir" 2>/dev/null || return 1
+    [ "$(id -u)" != 0 ] || chown root:wheel "$_pdir" 2>/dev/null || true
+}
+
+save_companion_includes() {
+    _parent=$1
+    _inc_dir=$(includes_dir_for "$_parent")
+    _incs=$(companion_includes_for "$_parent")
+    if [ -z "$_incs" ]; then
+        if [ -f "$_inc_dir/manifest" ]; then
+            rm -f "$_inc_dir"/*.bak "$_inc_dir/manifest"
+        fi
+        return 0
+    fi
+
+    ensure_private_dir "$_inc_dir" || return 1
+    _manifest_tmp=$(mktemp "$_inc_dir/.manifest.XXXXXX") || return 1
+    _old_nl='
+'
+    _staged_bak=''
+    _save_ok=1
+    _ifs_old=$IFS
+    IFS=$_old_nl
+    for _inc in $_incs; do
+        [ -n "$_inc" ] || continue
+        _bak="$_inc_dir/$(slug_for "$_inc").bak"
+        _tmp=$(mktemp "$_inc_dir/.inc-good.XXXXXX") || { _save_ok=0; break; }
+        if cp -p "$_inc" "$_tmp"; then
+            mv -f "$_tmp" "$_bak" || { rm -f "$_tmp"; _save_ok=0; break; }
+        else
+            rm -f "$_tmp"
+            _save_ok=0
+            break
+        fi
+        printf '%s\n' "$_inc" >> "$_manifest_tmp"
+        _staged_bak="${_staged_bak}|$(basename "$_bak")|"
+    done
+    IFS=$_ifs_old
+
+    if [ "$_save_ok" -ne 1 ]; then
+        rm -f "$_manifest_tmp"
+        return 1
+    fi
+
+    for _existing in "$_inc_dir"/*.bak; do
+        [ -e "$_existing" ] || continue
+        case "$_staged_bak" in
+            *"|$(basename "$_existing")|"*) ;;
+            *) rm -f "$_existing" ;;
+        esac
+    done
+    if ! mv -f "$_manifest_tmp" "$_inc_dir/manifest"; then
+        rm -f "$_manifest_tmp"
+        return 1
+    fi
+    return 0
+}
+
+save_known_good() {
+    _file=$1
+    _good=$(good_copy_for "$_file")
+    _tmp=$(mktemp "${GOOD_DIR}/.known-good.XXXXXX") || return 1
+    if cp -p "$_file" "$_tmp" && mv -f "$_tmp" "$_good"; then
+        save_companion_includes "$_file" || return 1
+        return 0
+    fi
+    rm -f "$_tmp"
+    return 1
+}
+
+atomic_restore_file() {
+    _src=$1
+    _dst=$2
+    _rej=${3:-}
+    [ -f "$_src" ] && [ ! -L "$_src" ] || return 1
+    [ ! -L "$_dst" ] || return 1
+    # The live file is kept, not deleted: it is the only evidence of what went
+    # wrong, and a repair that destroys the evidence makes the next occurrence
+    # harder to explain.
+    if [ -n "$_rej" ] && [ -f "$_dst" ]; then
+        cp -p "$_dst" "$_rej" 2>/dev/null || true
+    fi
+    _tmp=$(mktemp "$(dirname "$_dst")/.config-guard.XXXXXX") || return 1
+    if ! cp -p "$_src" "$_tmp"; then
+        rm -f "$_tmp"
+        return 1
+    fi
+    # Preserve the live file's ownership and mode rather than the snapshot's:
+    # the service may have had them adjusted deliberately since.
+    # `stat -f` is the FreeBSD spelling and `stat -c` the GNU one. Both are
+    # tried so this runs identically on the target and under the test suite --
+    # a permission rule that only the untested path enforces is not a rule.
+    # Each attempt is isolated: chaining them with `||` inside one command
+    # substitution concatenates the failed dialect's output with the successful
+    # one's, and GNU stat writes to stdout even when it rejects the format.
+    _mode=$(stat -f '%Lp' "$_dst" 2>/dev/null) || _mode=''
+    case "$_mode" in
+        ''|*[!0-7]*) _mode=$(stat -c '%a' "$_dst" 2>/dev/null) || _mode='' ;;
+    esac
+    case "$_mode" in
+        ''|*[!0-7]*) ;;
+        *) chmod "$_mode" "$_tmp" 2>/dev/null || true ;;
+    esac
+    if ! mv -f "$_tmp" "$_dst"; then
+        rm -f "$_tmp"
+        return 1
+    fi
+    return 0
+}
+
+restore_known_good() {
+    _file=$1
+    _good=$(good_copy_for "$_file")
+    [ -f "$_good" ] && [ ! -L "$_good" ] || return 1
+    _stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+    atomic_restore_file "$_good" "$_file" "${GOOD_DIR}/$(slug_for "$_file").rejected.${_stamp}" || return 1
+
+    _inc_dir=$(includes_dir_for "$_file")
+    if [ -f "$_inc_dir/manifest" ] && [ ! -L "$_inc_dir/manifest" ]; then
+        _ifs_old=$IFS
+        IFS='
+'
+        while IFS= read -r _inc || [ -n "$_inc" ]; do
+            [ -n "$_inc" ] || continue
+            _inc_good="$_inc_dir/$(slug_for "$_inc").bak"
+            [ -f "$_inc_good" ] && [ ! -L "$_inc_good" ] || continue
+            atomic_restore_file "$_inc_good" "$_inc" "$_inc_dir/$(slug_for "$_inc").rejected.${_stamp}" || {
+                IFS=$_ifs_old
+                return 1
+            }
+        done < "$_inc_dir/manifest"
+        IFS=$_ifs_old
+    fi
+    return 0
+}
+
+check_one() {
+    _file=$1
+    [ -f "$_file" ] && [ ! -L "$_file" ] || return 0
+    checker_for "$_file" >/dev/null 2>&1 || return 0
+
+    if validates "$_file"; then
+        save_known_good "$_file" || log "WARNING: cannot record a known-good copy of $_file"
+        return 0
+    fi
+
+    log "CRITICAL: $_file does not validate; its service cannot start from it"
+    if ! restore_known_good "$_file"; then
+        log "CRITICAL: no known-good copy of $_file to restore; manual repair required"
+        BROKEN=$((BROKEN + 1))
+        condemn "$_file"
+        return 0
+    fi
+    if validates "$_file"; then
+        log "REPAIRED: $_file restored from the last copy that validated"
+        REPAIRED=$((REPAIRED + 1))
+    else
+        log "CRITICAL: the restored copy of $_file does not validate either"
+        BROKEN=$((BROKEN + 1))
+        condemn "$_file"
+    fi
+}
+
+# Ownership is set only when running as root: the guard is also exercised by the
+# test suite as an ordinary user, and refusing to run there would mean the one
+# environment that can prove its behaviour is the one that cannot run it.
+install -d -m 0700 "$GOOD_DIR" 2>/dev/null || {
+    printf 'cannot create %s\n' "$GOOD_DIR" >&2
+    exit 2
+}
+[ "$(id -u)" != 0 ] || chown root:wheel "$GOOD_DIR" 2>/dev/null || true
+
+for conf in "$PF_CONF" "$DHCPD_CONF" "$UNBOUND_CONF" "$NGINX_CONF"; do
+    check_one "$conf"
+done
+
+# NUT is a five-file contract and has no side-effect-free checker for the
+# complete set: driver checks can open the serial port. The bootstrap's check
+# mode validates completeness, placeholders and monitor credential agreement
+# without writing or touching the running driver. A build VM has nut_enable=NO
+# and is deliberately outside this hardware-only gate.
+if [ "$(sysrc -n nut_enable 2>/dev/null || true)" = YES ]; then
+    if [ ! -x "$UPS_BOOTSTRAP" ] || ! "$UPS_BOOTSTRAP" --check >/dev/null 2>&1; then
+        log "CRITICAL: NUT configuration is incomplete or inconsistent"
+        BROKEN=$((BROKEN + 1))
+        UNSTARTABLE="$UNSTARTABLE nut nut_upsmon"
+    fi
+fi
+
+if [ "$BROKEN" -ne 0 ]; then
+    # Last line, and printed even when the list is somehow empty: a caller that
+    # parses this must be able to tell "nothing to skip" from "the guard never
+    # said", and an absent line reads as the latter.
+    log "UNSTARTABLE:$UNSTARTABLE"
+    exit 2
+fi
+[ "$REPAIRED" -eq 0 ] || exit 1
+exit 0

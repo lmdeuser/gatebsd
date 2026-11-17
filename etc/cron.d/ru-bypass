@@ -1,0 +1,2 @@
+# Package-owned schedule for the validated RU prefix-table update.
+0 3 * * * root /usr/local/sbin/ru-bypass-update.sh >> /var/log/ru-bypass.log 2>&1

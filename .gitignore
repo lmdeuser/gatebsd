@@ -1,0 +1,32 @@
+# Backup images
+backup/*.img.gz
+backup/*.img
+backup/*.gz
+
+# Build artifacts
+dist/
+pkg/stage/
+pkg/stage.tar
+
+# Python
+__pycache__/
+*.pyc
+
+# DHCP config
+dhcpd.conf
+
+# Secrets and local CI configs
+.secrets/
+ci/setup_ci_master.sh
+ci/setup_local_mirror.sh
+
+# Amnezia Premium subscription token. Never in git, and never in a release archive.
+amnezia_premium.vpn
+*.vpn
+
+# Per-machine local settings
+.claude/settings.local.json
+
+# Syncthing folder markers
+.stfolder/
+.stfolder.removed-*/

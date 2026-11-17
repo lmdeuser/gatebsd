@@ -1,0 +1,1394 @@
+#!/bin/sh
+# Migrate permissions of existing trusted GateBSD configuration files.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+MAIN_CONF=${GATEBSD_MAIN_CONF:-/usr/local/etc/gatebsd/gatebsd.conf}
+FAILOVER_CONF=${GATEBSD_FAILOVER_CONF:-/usr/local/etc/gatebsd/failover.conf}
+GATEWAY_CONF=${GATEBSD_GATEWAY_CONF:-/usr/local/etc/amnezia/gateway.conf}
+LEGACY_RU_STATE=${GATEBSD_LEGACY_RU_STATE:-/var/db/gatebsd/ru-routes.applied}
+RU_STATE_FILE=${RU_STATE_FILE:-/var/db/gatebsd-system/ru-routes.applied}
+UNBOUND_CONF=${GATEBSD_UNBOUND_CONF:-/usr/local/etc/unbound/unbound.conf}
+UNBOUND_LOCK=${GATEBSD_UNBOUND_LOCK:-${UNBOUND_CONF}.gatebsd.lock}
+ETC_DIR=${GATEBSD_ETC_DIR:-/usr/local/etc/gatebsd}
+SPLIT_DNS_CONF=${GATEBSD_SPLIT_DNS_CONF:-${ETC_DIR}/split-dns.conf}
+UNBOUND_SPLIT_DNS_CONF=${GATEBSD_UNBOUND_SPLIT_DNS_CONF:-/usr/local/etc/unbound/split-dns.conf}
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+BACKEND=${GATEBSD_BACKEND:-/usr/local/share/gatebsd/webui/backend}
+DNS_CANARY_ZONE=${GATEBSD_DNS_CANARY_ZONE:-use-application-dns.net}
+PF_CONF=${GATEBSD_PF_CONF:-/etc/pf.conf}
+PF_LOCK=${GATEBSD_PF_LOCK:-${PF_CONF}.gatebsd.lock}
+RC_DIR=${GATEBSD_RC_DIR:-/usr/local/etc/rc.d}
+NGINX_CONF=${GATEBSD_NGINX_CONF:-/usr/local/etc/nginx/conf.d/gatebsd.conf}
+NGINX_BACKUP_DIR=${GATEBSD_NGINX_BACKUP_DIR:-/var/backups/gatebsd-nginx}
+SYSCTL_CONF=${GATEBSD_SYSCTL_CONF:-/etc/sysctl.conf}
+LOG_DIR=${GATEBSD_LOG_DIR:-/var/log}
+
+fail() { echo "gatebsd-config-migrate: $*" >&2; exit 1; }
+warn() { echo "gatebsd-config-migrate: $*" >&2; }
+
+# stat(1) takes -f on FreeBSD, where this runs in production, and -c on Linux,
+# where the container harness runs it. The GNU form is tried first, and the
+# order is not arbitrary: on GNU, `stat -f` is not an error but a different
+# command entirely -- filesystem status -- so it exits 0 and prints a number
+# that is not a uid. A BSD-first fallback therefore never fires and reads every
+# file as foreign. `stat -c` is simply rejected on FreeBSD (verified on the
+# stand), so trying it first is safe in both directions.
+#
+# Defined here rather than beside their first reader because migrate_one used
+# to call `stat -f` directly. On FreeBSD that agreed with these helpers; under
+# the harness it read every root-owned file as foreign, so the migration
+# refused any configuration it was pointed at and no test could reach the steps
+# below it. One implementation, used by everything.
+file_uid() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null; }
+file_gid() { stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1" 2>/dev/null; }
+file_perm() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+file_links() {
+    _fl=$(stat -c '%h' "$1" 2>/dev/null || stat -f '%l' "$1" 2>/dev/null || true)
+    case "$_fl" in
+        ''|*[!0-9]*) printf '%s\n' 1 ;;
+        *) printf '%s\n' "$_fl" ;;
+    esac
+}
+
+# `--dns-canary` is internal: the parent re-enters here holding the Unbound
+# configuration lock, so this run does that one step and nothing else.
+DNS_CANARY_ONLY=0
+LOCKED_STEP=''
+case "${1:-}" in
+    "") [ "$#" -eq 0 ] || fail "too many arguments" ;;
+    --dns-canary)
+        [ "$#" -eq 1 ] || fail "too many arguments"
+        DNS_CANARY_ONLY=1
+        ;;
+    --locked-step)
+        [ "$#" -eq 2 ] || fail "missing --locked-step name"
+        LOCKED_STEP=$2
+        ;;
+    *) fail "unknown argument: $1" ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || fail "root privileges are required"
+
+# Firefox resolves use-application-dns.net before deciding whether to turn its
+# own DNS-over-HTTPS resolver on. While that name answers, the browser stops
+# asking us, and the blocklist and every other DNS policy on this device are
+# bypassed -- measured on the production router, where the canary resolved to
+# 35.190.14.201. NXDOMAIN is the documented signal to stay with the local
+# resolver.
+#
+# The sample carries the same directive, but the sample only ever reaches a
+# device that has no unbound.conf at all: the installer preserves network
+# configuration on purpose (gatebsd-install prints "Network policy: PRESERVE")
+# and the package installs the sample only when the destination is missing. A
+# device already in the field is therefore this function's job -- the other
+# half of the same delivery.
+canary_present() {
+    [ -r "$UNBOUND_CONF" ] || return 1
+    # awk on an unreadable file exits 2, which under `set -e` would kill the
+    # script here rather than at the test above.
+    awk -v zone="$DNS_CANARY_ZONE" '
+        function zone_name(line) {
+            sub(/^[[:space:]]*local-zone:[[:space:]]*/, "", line)
+            if (line ~ /^"/) {
+                sub(/^"/, "", line)
+                sub(/".*$/, "", line)
+            } else {
+                sub(/[[:space:]].*$/, "", line)
+                sub(/#.*$/, "", line)
+            }
+            sub(/\.$/, "", line)
+            return tolower(line)
+        }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*local-zone:[[:space:]]*/ {
+            if (zone_name($0) == tolower(zone)) found=1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$UNBOUND_CONF"
+}
+
+canary_wanted() {
+    [ -e "$UNBOUND_CONF" ] || [ -L "$UNBOUND_CONF" ] || return 1
+    if [ ! -f "$UNBOUND_CONF" ] || [ -L "$UNBOUND_CONF" ]; then
+        warn "refusing unsafe Unbound configuration: $UNBOUND_CONF"
+        return 1
+    fi
+    [ -r "$UNBOUND_CONF" ] || { warn "cannot read Unbound configuration: $UNBOUND_CONF"; return 1; }
+    ! canary_present
+}
+
+apply_dns_canary() {
+    canary_wanted || return 0
+    command -v unbound-checkconf >/dev/null 2>&1 || {
+        warn "unbound-checkconf is unavailable; DNS canary not applied"
+        return 0
+    }
+
+    _conf_dir=$(dirname "$UNBOUND_CONF")
+    _canary_tmp=$(mktemp "$_conf_dir/.unbound.conf.XXXXXX") || {
+        warn "cannot stage an Unbound configuration; DNS canary not applied"
+        return 0
+    }
+    _canary_backup=$(mktemp "$_conf_dir/.unbound.conf.XXXXXX") || {
+        rm -f "$_canary_tmp"
+        warn "cannot stage an Unbound backup; DNS canary not applied"
+        return 0
+    }
+    trap 'rm -f "$_canary_tmp" "$_canary_backup"' EXIT
+    trap 'rm -f "$_canary_tmp" "$_canary_backup"; exit 1' HUP INT TERM
+
+    _canary_done=0
+    if cp -p "$UNBOUND_CONF" "$_canary_backup" && cat "$UNBOUND_CONF" > "$_canary_tmp"; then
+        # A repeated `server:` clause is how the generated blocklist adds its
+        # own local-zone lines too; unbound merges them.
+        printf '\n# GateBSD: keep browsers on this resolver instead of their own DoH\nserver:\n    local-zone: "%s" always_nxdomain\n' \
+            "$DNS_CANARY_ZONE" >> "$_canary_tmp" || _canary_done=-1
+    else
+        _canary_done=-1
+    fi
+
+    if [ "$_canary_done" -eq 0 ]; then
+        _canary_mode=$(stat -f '%Lp' "$UNBOUND_CONF" 2>/dev/null || true)
+        case "$_canary_mode" in
+            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+            *) _canary_mode=0644 ;;
+        esac
+        chown root:wheel "$_canary_tmp" && chmod "$_canary_mode" "$_canary_tmp" || _canary_done=-1
+    fi
+
+    if [ "$_canary_done" -eq 0 ]; then
+        if unbound-checkconf "$_canary_tmp" >/dev/null 2>&1; then
+            if mv -f "$_canary_tmp" "$UNBOUND_CONF"; then
+                _canary_done=1
+            else
+                _canary_done=-1
+            fi
+        else
+            warn "Unbound rejected the DNS canary; configuration left unchanged"
+            _canary_done=-1
+        fi
+    fi
+
+    if [ "$_canary_done" -eq 1 ]; then
+        # Only a running resolver is reloaded. On a fresh install unbound has
+        # not been started yet and the directive applies at first start.
+        if service unbound onestatus >/dev/null 2>&1; then
+            if service unbound reload >/dev/null 2>&1 || service unbound restart >/dev/null 2>&1; then
+                :
+            else
+                warn "Unbound did not accept the DNS canary; restoring previous configuration"
+                if cp -p "$_canary_backup" "$UNBOUND_CONF"; then
+                    service unbound restart >/dev/null 2>&1 || \
+                        warn "previous configuration restored but Unbound did not start"
+                else
+                    warn "ERROR: failed to restore the previous Unbound configuration"
+                fi
+                _canary_done=-1
+            fi
+        fi
+    fi
+
+    [ "$_canary_done" -eq 1 ] && echo "gatebsd-config-migrate: DNS canary applied to $UNBOUND_CONF"
+    rm -f "$_canary_tmp" "$_canary_backup"
+    trap - EXIT HUP INT TERM
+    return 0
+}
+
+# The blocklist updater and the UI's DNS writer serialize their writes to
+# unbound.conf on this lock; an unlocked writer here is how the blocklist was
+# corrupted once already. gatebsd-upgrade holds every configuration lock for
+# the whole upgrade, so re-taking this one from inside it would deadlock the
+# delivery mechanism -- honour its flag instead of blocking on the lock.
+migrate_dns_canary() {
+    if [ "${GATEBSD_UNBOUND_LOCK_HELD:-0}" = 1 ] || [ "${GATEBSD_UPGRADE_CONFIG_LOCKS_HELD:-0}" = 1 ]; then
+        apply_dns_canary
+        return 0
+    fi
+    canary_wanted || return 0
+    if [ ! -x "$PYTHON_LAUNCHER" ]; then
+        warn "Python launcher is unavailable; DNS canary not applied"
+        return 0
+    fi
+    env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_PATH="$PATH" \
+        GATEBSD_UNBOUND_CONF="$UNBOUND_CONF" \
+        GATEBSD_UNBOUND_LOCK="$UNBOUND_LOCK" \
+        GATEBSD_DNS_CANARY_ZONE="$DNS_CANARY_ZONE" \
+        GATEBSD_UNBOUND_LOCK_HELD=1 \
+        PYTHONPATH="$BACKEND" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.lockrun "$UNBOUND_LOCK" -- "$0" --dns-canary \
+        || warn "DNS canary migration failed"
+}
+
+migrate_split_dns() {
+    [ -f "$UNBOUND_CONF" ] && [ ! -L "$UNBOUND_CONF" ] || return 0
+    if [ ! -x "$PYTHON_LAUNCHER" ]; then
+        warn "Python launcher is unavailable; Split-DNS not synchronized"
+        return 0
+    fi
+    env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_ETC_DIR="$ETC_DIR" \
+        GATEBSD_UNBOUND_CONF="$UNBOUND_CONF" \
+        GATEBSD_SPLIT_DNS_CONF="$SPLIT_DNS_CONF" \
+        GATEBSD_UNBOUND_SPLIT_DNS_CONF="$UNBOUND_SPLIT_DNS_CONF" \
+        GATEBSD_UNBOUND_LOCK_HELD="${GATEBSD_UNBOUND_LOCK_HELD:-0}" \
+        GATEBSD_UPGRADE_CONFIG_LOCKS_HELD="${GATEBSD_UPGRADE_CONFIG_LOCKS_HELD:-0}" \
+        PYTHONPATH="$BACKEND" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.writers.dns --sync-split-dns --if-running \
+        || warn "Split-DNS migration failed"
+}
+
+if [ "$DNS_CANARY_ONLY" -eq 1 ]; then
+    apply_dns_canary
+    exit 0
+fi
+
+run_unbound_locked() {
+    _step=$1
+    if [ "${GATEBSD_UNBOUND_LOCK_HELD:-0}" = 1 ] || [ "${GATEBSD_UPGRADE_CONFIG_LOCKS_HELD:-0}" = 1 ]; then
+        "$_step"
+        return $?
+    fi
+    if [ -x "$PYTHON_LAUNCHER" ] && [ -d "$BACKEND" ]; then
+        env -i PATH="$PATH" HOME="${HOME:-/root}" LANG="${LANG:-C.UTF-8}" \
+            GATEBSD_PATH="$PATH" \
+            GATEBSD_UNBOUND_CONF="$UNBOUND_CONF" \
+            GATEBSD_UNBOUND_LOCK="$UNBOUND_LOCK" \
+            GATEBSD_UNBOUND_STATE_DIR="${GATEBSD_UNBOUND_STATE_DIR:-/usr/local/etc/unbound/state}" \
+            GATEBSD_UNBOUND_LEGACY_ANCHOR="${GATEBSD_UNBOUND_LEGACY_ANCHOR:-/usr/local/etc/unbound/root.key}" \
+            GATEBSD_DNS_CANARY_ZONE="$DNS_CANARY_ZONE" \
+            GATEBSD_UNBOUND_LOCK_HELD=1 \
+            PYTHONPATH="$BACKEND" \
+            "$PYTHON_LAUNCHER" -m gatebsd_ui.lockrun "$UNBOUND_LOCK" -- "$0" --locked-step "$_step"
+    elif command -v flock >/dev/null 2>&1; then
+        GATEBSD_UNBOUND_LOCK_HELD=1 \
+            flock "$UNBOUND_LOCK" "$0" --locked-step "$_step"
+    else
+        warn "lock helper unavailable; running $_step unlocked"
+        "$_step"
+    fi
+}
+
+run_pf_locked() {
+    _step=$1
+    if [ "${GATEBSD_PF_LOCK_HELD:-0}" = 1 ] || [ "${GATEBSD_UPGRADE_CONFIG_LOCKS_HELD:-0}" = 1 ]; then
+        "$_step"
+        return $?
+    fi
+    if [ -x "$PYTHON_LAUNCHER" ] && [ -d "$BACKEND" ]; then
+        env -i PATH="$PATH" HOME="${HOME:-/root}" LANG="${LANG:-C.UTF-8}" \
+            GATEBSD_PATH="$PATH" \
+            GATEBSD_PF_CONF="$PF_CONF" \
+            GATEBSD_PF_LOCK="$PF_LOCK" \
+            GATEBSD_DOH_ENDPOINTS="$DOH_ENDPOINTS" \
+            GATEBSD_PF_LOCK_HELD=1 \
+            PYTHONPATH="$BACKEND" \
+            "$PYTHON_LAUNCHER" -m gatebsd_ui.lockrun "$PF_LOCK" -- "$0" --locked-step "$_step"
+    elif command -v flock >/dev/null 2>&1; then
+        GATEBSD_PF_LOCK_HELD=1 \
+            flock "$PF_LOCK" "$0" --locked-step "$_step"
+    else
+        warn "lock helper unavailable; running $_step unlocked"
+        "$_step"
+    fi
+}
+
+migrate_one() {
+    _path=$1
+    _mode=$2
+    if [ ! -e "$_path" ] && [ ! -L "$_path" ]; then
+        return 0
+    fi
+    [ -f "$_path" ] && [ ! -L "$_path" ] || fail "unsafe configuration path: $_path"
+
+    # Never turn attacker-controlled content into trusted root configuration.
+    # Legacy files may have an incorrect group/mode, but their owner must
+    # already be root before migration is allowed.
+    _uid=$(file_uid "$_path" || printf '%s' -1)
+    [ "$_uid" = 0 ] || fail "refusing non-root-owned configuration: $_path"
+
+    chown root:wheel "$_path"
+    chmod "$_mode" "$_path"
+
+    _uid=$(file_uid "$_path" || printf '%s' -1)
+    _actual_mode=$(file_perm "$_path" || printf '%s' invalid)
+    [ "$_uid" = 0 ] || fail "owner migration failed: $_path"
+    [ "$_actual_mode" = "${_mode#0}" ] || fail "mode migration failed: $_path"
+}
+
+
+migrate_route_state() {
+    [ "$LEGACY_RU_STATE" != "$RU_STATE_FILE" ] || return 0
+    if [ ! -e "$LEGACY_RU_STATE" ] && [ ! -L "$LEGACY_RU_STATE" ]; then
+        return 0
+    fi
+    if [ ! -f "$LEGACY_RU_STATE" ] || [ -L "$LEGACY_RU_STATE" ]; then
+        echo "gatebsd-config-migrate: ignoring unsafe legacy route state: $LEGACY_RU_STATE" >&2
+        return 0
+    fi
+    _legacy_uid=$(stat -f '%u' "$LEGACY_RU_STATE" 2>/dev/null || printf '%s' -1)
+    _legacy_mode=$(stat -f '%Lp' "$LEGACY_RU_STATE" 2>/dev/null || printf '%s' 777)
+    if [ "$_legacy_uid" != 0 ]; then
+        echo "gatebsd-config-migrate: ignoring non-root-owned legacy route state: $LEGACY_RU_STATE" >&2
+        return 0
+    fi
+    case "$_legacy_mode" in
+        *[2367][0-7]|*[0-7][2367])
+            echo "gatebsd-config-migrate: ignoring writable legacy route state: $LEGACY_RU_STATE" >&2
+            return 0
+            ;;
+    esac
+
+    _state_dir=$(dirname "$RU_STATE_FILE")
+    if [ -e "$_state_dir" ] || [ -L "$_state_dir" ]; then
+        [ -d "$_state_dir" ] && [ ! -L "$_state_dir" ] || fail "unsafe route state directory: $_state_dir"
+        _uid=$(stat -f '%u' "$_state_dir" 2>/dev/null || printf '%s' -1)
+        _mode=$(stat -f '%Lp' "$_state_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_uid" = 0 ] || fail "route state directory must be root-owned: $_state_dir"
+        case "$_mode" in *[2367][0-7]|*[0-7][2367]) fail "route state directory is writable by group or world: $_state_dir" ;; esac
+    else
+        install -d -o root -g wheel -m 0750 "$_state_dir"
+    fi
+
+    if [ -e "$RU_STATE_FILE" ] || [ -L "$RU_STATE_FILE" ]; then
+        [ -f "$RU_STATE_FILE" ] && [ ! -L "$RU_STATE_FILE" ] || fail "unsafe route state path: $RU_STATE_FILE"
+        _uid=$(stat -f '%u' "$RU_STATE_FILE" 2>/dev/null || printf '%s' -1)
+        [ "$_uid" = 0 ] || fail "route state must be root-owned: $RU_STATE_FILE"
+        return 0
+    fi
+
+    _temporary="$_state_dir/.ru-routes.migrate.$$"
+    trap 'rm -f "$_temporary"' EXIT
+    trap 'rm -f "$_temporary"; exit 1' HUP INT TERM
+    install -o root -g wheel -m 0640 "$LEGACY_RU_STATE" "$_temporary"
+    mv -f "$_temporary" "$RU_STATE_FILE"
+    trap - EXIT HUP INT TERM
+}
+
+# Hand the web UI's data directory to the service account.
+#
+# The UI used to run as `www` and its state was written with that identity. When
+# it moved to its own unprivileged account, nothing converted the data left
+# behind, so an *upgraded* device ends up with /var/db/gatebsd holding
+# auth.hash and session.secret owned by www while the UI runs as gatebsd. The UI
+# then cannot read its own credentials: every request 503s with "agent
+# unavailable", and once past that, every authenticated request dies on the
+# session revocation file and nginx answers 502. A freshly installed device is
+# unaffected, which is exactly why this survived so long -- it only appears on
+# the delivery path that upgrades an existing customer.
+#
+# Only entries owned by root or by the legacy account are touched. Anything else
+# in there was not put there by us, and re-owning it would be handing an
+# attacker's file to the service account.
+UI_DB_DIR=${GATEBSD_DB_DIR:-/var/db/gatebsd}
+UI_SERVICE_USER=${GATEBSD_SERVICE_USER:-gatebsd}
+UI_SERVICE_GROUP=${GATEBSD_SERVICE_GROUP:-gatebsd}
+UI_LEGACY_USER=${GATEBSD_LEGACY_UI_USER:-www}
+
+migrate_ui_data_dir() {
+    [ -e "$UI_DB_DIR" ] || return 0
+    [ -d "$UI_DB_DIR" ] && [ ! -L "$UI_DB_DIR" ] || fail "unsafe UI data directory: $UI_DB_DIR"
+    pw usershow "$UI_SERVICE_USER" >/dev/null 2>&1 || return 0
+    pw groupshow "$UI_SERVICE_GROUP" >/dev/null 2>&1 || return 0
+
+    _legacy_uid=$(pw usershow "$UI_LEGACY_USER" 2>/dev/null | awk -F: '{print $3}')
+    _service_uid=$(pw usershow "$UI_SERVICE_USER" | awk -F: '{print $3}')
+
+    _dir_uid=$(file_uid "$UI_DB_DIR" || printf '%s' -1)
+    case "$_dir_uid" in
+        0|"$_service_uid"|"${_legacy_uid:--}")
+            chown -h "$UI_SERVICE_USER:$UI_SERVICE_GROUP" "$UI_DB_DIR"
+            chmod 0750 "$UI_DB_DIR"
+            ;;
+        *) fail "UI data directory has an unexpected owner: $UI_DB_DIR" ;;
+    esac
+
+    for _entry in "$UI_DB_DIR"/*; do
+        [ -e "$_entry" ] || continue
+        # Symlinks are never followed and never re-owned: a link planted here
+        # would otherwise redirect the chown at any file on the system.
+        [ ! -L "$_entry" ] || { echo "gatebsd-config-migrate: ignoring symlink in UI data: $_entry" >&2; continue; }
+        [ -f "$_entry" ] || continue
+        _entry_links=$(file_links "$_entry")
+        [ "$_entry_links" -eq 1 ] || { echo "gatebsd-config-migrate: ignoring hardlinked file in UI data: $_entry" >&2; continue; }
+        _entry_uid=$(file_uid "$_entry" || printf '%s' -1)
+        case "$_entry_uid" in
+            0|"$_service_uid"|"${_legacy_uid:--}")
+                chown -h "$UI_SERVICE_USER:$UI_SERVICE_GROUP" "$_entry"
+                ;;
+            *)
+                echo "gatebsd-config-migrate: leaving foreign-owned UI state alone: $_entry" >&2
+                ;;
+        esac
+    done
+}
+
+migrate_system_prefixes() {
+    _prefixes=${GATEBSD_SYSTEM_PREFIXES:-"/usr /usr/local /usr/local/etc /usr/local/sbin /usr/local/share"}
+    _leftovers=${GATEBSD_SBIN_LEFTOVERS_DIR:-/var/backups/gatebsd-sbin-leftovers}
+    _is_root=0
+    [ "$(id -u)" -eq 0 ] && _is_root=1
+
+    for _pfx in $_prefixes; do
+        [ -e "$_pfx" ] || continue
+        [ -d "$_pfx" ] && [ ! -L "$_pfx" ] || { warn "system prefix is not a real directory: $_pfx"; continue; }
+        _puid=$(file_uid "$_pfx" || printf '%s' -1)
+        _pgid=$(file_gid "$_pfx" || printf '%s' -1)
+        _pmode=$(file_perm "$_pfx" || printf '%s' 755)
+        [ -n "$_pmode" ] || _pmode=755
+        if [ "$_is_root" -eq 1 ] && { [ "$_puid" != 0 ] || [ "$_pgid" != 0 ]; }; then
+            chown 0:0 "$_pfx"
+        fi
+        case "$_pmode" in
+            755|0755) ;;
+            *)
+                if [ "$_is_root" -eq 1 ] || [ -w "$_pfx" ]; then
+                    chmod 0755 "$_pfx"
+                fi
+                ;;
+        esac
+
+        case "$_pfx" in
+            */etc|/etc)
+                for _sub in "$_pfx/pkg" "$_pfx/dhcpd.conf.lock"; do
+                    [ -e "$_sub" ] && [ ! -L "$_sub" ] || continue
+                    _suid=$(file_uid "$_sub" || printf '%s' -1)
+                    _sgid=$(file_gid "$_sub" || printf '%s' -1)
+                    if [ "$_is_root" -eq 1 ] && { [ "$_suid" != 0 ] || [ "$_sgid" != 0 ]; }; then
+                        chown -h 0:0 "$_sub"
+                    fi
+                    if [ -d "$_sub" ]; then
+                        _smode=$(file_perm "$_sub" || printf '%s' 755)
+                        [ -n "$_smode" ] || _smode=755
+                        case "$_smode" in
+                            755|0755) ;;
+                            *)
+                                if [ "$_is_root" -eq 1 ] || [ -w "$_sub" ]; then
+                                    chmod 0755 "$_sub"
+                                fi
+                                ;;
+                        esac
+                    fi
+                done
+                ;;
+            */sbin|/sbin)
+                for _stale in "$_pfx"/*.pkgsave "$_pfx"/*.bak "$_pfx"/*.before-*; do
+                    [ -e "$_stale" ] || continue
+                    [ ! -L "$_stale" ] && [ -f "$_stale" ] || continue
+                    if [ ! -e "$_leftovers" ]; then
+                        mkdir -p "$_leftovers" || { warn "cannot create sbin leftovers dir: $_leftovers"; continue; }
+                    fi
+                    [ ! -L "$_leftovers" ] && [ -d "$_leftovers" ] || { warn "unsafe sbin leftovers dir: $_leftovers"; break; }
+                    if [ "$_is_root" -eq 1 ] || [ -w "$_leftovers" ]; then
+                        chmod 0700 "$_leftovers"
+                    fi
+                    [ "$_is_root" -eq 0 ] || chown 0:0 "$_leftovers"
+                    _base=$(basename "$_stale")
+                    _dest="$_leftovers/$_base"
+                    if [ -e "$_dest" ]; then
+                        _dest="$_leftovers/${_base}.$$"
+                    fi
+                    mv -f "$_stale" "$_dest"
+                    chmod 0600 "$_dest" 2>/dev/null || true
+                    [ "$_is_root" -eq 0 ] || chown -h 0:0 "$_dest"
+                done
+                ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------- DNS interception
+# The canary keeps a browser from *choosing* DoH. It does nothing about a client
+# that was simply pointed at 8.8.8.8, or one already speaking DoT to 9.9.9.9:853
+# -- both measured on the production router. Those need pf, and pf is where a
+# careless edit locks the operator out of a device whose only uplink is the link
+# being reconfigured.
+#
+# Appending is not an option here, which is the whole difficulty. Translation
+# rules must precede filter rules or pf refuses the file outright, and among
+# `quick` filter rules the first match wins -- so a block appended after the
+# existing `pass in quick ... to any` would parse, load, and do nothing at all.
+# Both rules are therefore inserted at named anchors, and a ruleset that does
+# not have them is left completely alone: a hand-written ruleset is the
+# operator's, and mangling it is worse than not helping.
+
+PF_RDR_MARK='rdr on $lan_if proto { tcp udp } from $lan_net to ! <local_nets> port 53'
+PF_BLOCK_MARK='block in quick on $lan_if proto { tcp udp } from $lan_net to ! <local_nets> port 853'
+
+DOH_ENDPOINTS=${GATEBSD_DOH_ENDPOINTS:-/usr/local/etc/gatebsd/doh-endpoints}
+PF_DOH_TABLE_MARK="table <doh> persist file \"$DOH_ENDPOINTS\""
+PF_DOH_BLOCK_MARK='block in quick on $lan_if proto { tcp udp } from $lan_net to <doh> port 443'
+
+pf_interception_present() {
+    [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ] || return 0
+    grep -Fq "$PF_RDR_MARK" "$PF_CONF" && grep -Fq "$PF_BLOCK_MARK" "$PF_CONF"
+}
+
+pf_interception_wanted() {
+    [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ] || return 1
+    _pf_uid=$(file_uid "$PF_CONF" || printf '%s' -1)
+    [ "$_pf_uid" = 0 ] || { warn "pf.conf is not root-owned; DNS interception not applied"; return 1; }
+    ! pf_interception_present
+}
+
+apply_dns_interception() {
+    pf_interception_wanted || return 0
+    command -v pfctl >/dev/null 2>&1 || {
+        warn "pfctl is unavailable; DNS interception not applied"
+        return 0
+    }
+    run_pf_locked apply_dns_interception_locked || warn "DNS interception migration failed"
+}
+
+apply_dns_interception_locked() {
+    pf_interception_wanted || return 0
+    command -v pfctl >/dev/null 2>&1 || {
+        warn "pfctl is unavailable; DNS interception not applied"
+        return 0
+    }
+
+    _pf_dir=$(dirname "$PF_CONF")
+    _pf_tmp=$(mktemp "$_pf_dir/.pf.conf.XXXXXX") || {
+        warn "cannot stage a pf ruleset; DNS interception not applied"
+        return 0
+    }
+    _pf_backup=$(mktemp "$_pf_dir/.pf.conf.XXXXXX") || {
+        rm -f "$_pf_tmp"
+        warn "cannot stage a pf backup; DNS interception not applied"
+        return 0
+    }
+    trap 'rm -f "$_pf_tmp" "$_pf_backup"' EXIT
+    trap 'rm -f "$_pf_tmp" "$_pf_backup"; exit 1' HUP INT TERM
+
+    # The anchors: the redirect goes after the last `nat on` rule, so it stays
+    # inside the translation section; the block goes straight after `block in
+    # all`, ahead of every `pass ... quick` that would otherwise win first.
+    if ! grep -q '^[[:space:]]*nat on ' "$PF_CONF" || ! grep -q '^[[:space:]]*block in all[[:space:]]*$' "$PF_CONF"; then
+        warn "pf.conf does not have the expected shape; DNS interception not applied"
+        rm -f "$_pf_tmp" "$_pf_backup"
+        trap - EXIT HUP INT TERM
+        return 0
+    fi
+
+    _pf_done=0
+    cp -p "$PF_CONF" "$_pf_backup" || _pf_done=-1
+    if [ "$_pf_done" -eq 0 ]; then
+        awk -v rdr="$PF_RDR_MARK" -v blk="$PF_BLOCK_MARK" '
+            { lines[NR] = $0; if ($0 ~ /^[[:space:]]*nat on /) last_nat = NR }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    print lines[i]
+                    if (i == last_nat) {
+                        print ""
+                        print "# GateBSD: keep clients on this resolver instead of one they chose"
+                        print rdr " -> ($lan_if)"
+                    }
+                    if (lines[i] ~ /^[[:space:]]*block in all[[:space:]]*$/) {
+                        print ""
+                        print "# GateBSD: DoT is how a client leaves without ever asking us"
+                        print blk
+                    }
+                }
+            }
+        ' "$PF_CONF" > "$_pf_tmp" || _pf_done=-1
+    fi
+
+    if [ "$_pf_done" -eq 0 ]; then
+        _pf_mode=$(file_perm "$PF_CONF" || true)
+        case "$_pf_mode" in
+            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+            *) _pf_mode=0600 ;;
+        esac
+        chown root:wheel "$_pf_tmp" && chmod "$_pf_mode" "$_pf_tmp" || _pf_done=-1
+    fi
+
+    if [ "$_pf_done" -eq 0 ]; then
+        if pfctl -nf "$_pf_tmp" >/dev/null 2>&1; then
+            mv -f "$_pf_tmp" "$PF_CONF" && _pf_done=1 || _pf_done=-1
+        else
+            warn "pf rejected the DNS interception rules; ruleset left unchanged"
+            _pf_done=-1
+        fi
+    fi
+
+    # Loading is separate from writing on purpose. A ruleset that parses but
+    # will not load must not stay on disk to be picked up by the next boot,
+    # which is when nobody is watching.
+    if [ "$_pf_done" -eq 1 ] && pfctl -s info >/dev/null 2>&1; then
+        if ! pfctl -f "$PF_CONF" >/dev/null 2>&1; then
+            warn "pf did not load the DNS interception rules; restoring previous ruleset"
+            if cp -p "$_pf_backup" "$PF_CONF"; then
+                pfctl -f "$PF_CONF" >/dev/null 2>&1 || \
+                    warn "ERROR: previous ruleset restored but pf did not load it"
+            else
+                warn "ERROR: failed to restore the previous pf ruleset"
+            fi
+            _pf_done=-1
+        fi
+    fi
+
+    [ "$_pf_done" -eq 1 ] && echo "gatebsd-config-migrate: DNS interception applied to $PF_CONF"
+    rm -f "$_pf_tmp" "$_pf_backup"
+    trap - EXIT HUP INT TERM
+    return 0
+}
+
+# ---------------------------------------------------------------- rc.d ownership
+# Found on the production router: /usr/local/etc/rc.d was operator:operator and
+# group-writable, with the amnezia script inside it owned the same way. rcorder(8)
+# reads that directory whole and init runs what it finds as root, so an
+# unprivileged account could put a file there and own the machine at next boot.
+# It is not a hypothetical: the same directory is where a hand-made backup that
+# kept its PROVIDE: line once ran ahead of the real script.
+#
+# Only what is actually wrong is changed. Blindly re-owning a directory that
+# already exists is how both shared runtime directories were broken before, and
+# a migration that rewrites correct state every run teaches everyone to ignore
+# its output.
+migrate_rc_directory() {
+    [ -d "$RC_DIR" ] && [ ! -L "$RC_DIR" ] || return 0
+
+    _rc_uid=$(file_uid "$RC_DIR" || printf '%s' -1)
+    _rc_mode=$(file_perm "$RC_DIR" || printf '%s' 777)
+    _rc_fixed=0
+    if [ "$_rc_uid" != 0 ]; then
+        chown root:wheel "$RC_DIR" && _rc_fixed=1 || warn "cannot take ownership of $RC_DIR"
+    fi
+    case "$_rc_mode" in
+        *[2367][0-7]|*[0-7][2367])
+            chmod 0755 "$RC_DIR" && _rc_fixed=1 || warn "cannot correct the mode of $RC_DIR"
+            ;;
+    esac
+    [ "$_rc_fixed" -eq 0 ] || echo "gatebsd-config-migrate: corrected ownership of $RC_DIR"
+
+    # A script in there runs as root whoever owns it, so a foreign-owned one is
+    # the same hole as a writable directory. Symlinks are never followed: a link
+    # planted here would redirect the chown at any file on the system.
+    for _rc_entry in "$RC_DIR"/*; do
+        [ -e "$_rc_entry" ] || continue
+        [ ! -L "$_rc_entry" ] || { warn "ignoring symlink in $RC_DIR: $_rc_entry"; continue; }
+        [ -f "$_rc_entry" ] || continue
+        _entry_uid=$(file_uid "$_rc_entry" || printf '%s' -1)
+        [ "$_entry_uid" = 0 ] && continue
+        if chown root:wheel "$_rc_entry"; then
+            echo "gatebsd-config-migrate: corrected ownership of $_rc_entry"
+        else
+            warn "cannot take ownership of $_rc_entry"
+        fi
+    done
+}
+
+# ------------------------------------------------------------ web UI bind address
+# Found auditing the production router from the outside in: both server blocks
+# said `listen 80 default_server;` and `listen 443 ssl default_server;` with no
+# address, so nginx was bound to every address the device has -- the public
+# PPPoE address, the backup carrier's, and the tunnel's -- and answered whatever
+# Host arrived. Nothing was reachable, because pf drops inbound on all three,
+# but that made one ruleset the entire defence: a pf that fails to load, or one
+# `pfctl -F rules`, and the administration panel is on the internet.
+#
+# The LAN address is read off the interface gateway.conf names rather than
+# written into the tree. This is a product; the next device's LAN will not be
+# 10.88.0.0/24, and a config that hardcodes one router's address is the same
+# defect as the pkg repository that lived only on one router.
+#
+# Nothing is reloaded here. A package script's children are SIGKILLed when it
+# returns, and `gatebsd-upgrade` already restarts nginx afterwards behind a
+# health gate -- so the new binding takes effect at the next nginx restart,
+# which is exactly the deal /boot/loader.conf.d gets.
+nginx_listen_is_unbound() {
+    grep -q '^[[:space:]]*listen[[:space:]]\{1,\}[0-9]\{1,\}[;[:space:]]' "$1"
+}
+
+migrate_nginx_listen() {
+    [ -f "$NGINX_CONF" ] && [ ! -L "$NGINX_CONF" ] || return 0
+    nginx_listen_is_unbound "$NGINX_CONF" || return 0
+
+    _lan_if=re1
+    # awk on an unreadable file exits 2, and under set -e that kills this script
+    # on the assignment itself -- the `2>/dev/null` would hide the message and
+    # not the status. Readability is tested first, as everywhere else here.
+    if [ -r "$GATEWAY_CONF" ]; then
+        _configured=$(awk -F= '/^[[:space:]]*LAN_IF=/{gsub(/["'\'']/, "", $2); print $2; exit}' "$GATEWAY_CONF")
+        [ -z "$_configured" ] || _lan_if=$_configured
+    fi
+    case "$_lan_if" in
+        ''|*[!A-Za-z0-9._]*)
+            warn "refusing an unusable LAN interface name: $_lan_if"
+            return 0
+            ;;
+    esac
+
+    _lan_addr=$(ifconfig "$_lan_if" inet 2>/dev/null | awk '/[[:space:]]inet /{print $2; exit}')
+    case "$_lan_addr" in
+        ''|*[!0-9.]*)
+            warn "cannot read an IPv4 address for $_lan_if; leaving $NGINX_CONF alone"
+            return 0
+            ;;
+    esac
+
+    # Without a validator the safe move is to change nothing: a rejected config
+    # takes the panel down at the next restart, and this runs unattended.
+    command -v nginx >/dev/null 2>&1 || {
+        warn "nginx is unavailable to validate the change; leaving $NGINX_CONF alone"
+        return 0
+    }
+
+    _stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    _keep=$NGINX_BACKUP_DIR/$_stamp
+    _staged=$NGINX_CONF.gatebsd-migrate
+    rm -f "$_staged"
+    if ! sed "s/^\([[:space:]]*\)listen\([[:space:]]\{1,\}\)\([0-9]\{1,\}\)\([;[:space:]]\)/\1listen\2${_lan_addr}:\3\4/" \
+            "$NGINX_CONF" > "$_staged"; then
+        rm -f "$_staged"
+        warn "cannot rewrite the listen directives in $NGINX_CONF"
+        return 0
+    fi
+
+    install -d -o root -g wheel -m 0750 "$_keep" || {
+        rm -f "$_staged"
+        warn "cannot keep a copy of $NGINX_CONF; leaving it alone"
+        return 0
+    }
+    cp -p "$NGINX_CONF" "$_keep/" || {
+        rm -f "$_staged"
+        warn "cannot keep a copy of $NGINX_CONF; leaving it alone"
+        return 0
+    }
+
+    # Written in place so the file keeps its own mode and ownership.
+    cat "$_staged" > "$NGINX_CONF"
+    rm -f "$_staged"
+    if nginx -t >/dev/null 2>&1; then
+        echo "gatebsd-config-migrate: bound the web UI to ${_lan_addr} in $NGINX_CONF"
+        echo "gatebsd-config-migrate: previous copy kept in $_keep"
+        echo "gatebsd-config-migrate: takes effect at the next nginx restart"
+    else
+        cat "$_keep/$(basename "$NGINX_CONF")" > "$NGINX_CONF"
+        warn "nginx rejected the bound listen directives; $NGINX_CONF left unchanged"
+    fi
+}
+
+migrate_nginx_auth_limit() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    [ -f "$NGINX_CONF" ] && [ ! -L "$NGINX_CONF" ] && [ "$(file_links "$NGINX_CONF")" -eq 1 ] || return 0
+    if grep -q 'location[[:space:]]*=[[:space:]]*/api/auth/login' "$NGINX_CONF"; then
+        return 0
+    fi
+    grep -q '^[[:space:]]*location[[:space:]]\{1,\}/api/[[:space:]]*{' "$NGINX_CONF" || return 0
+    command -v nginx >/dev/null 2>&1 || {
+        warn "nginx is unavailable to validate the auth rate limit; leaving $NGINX_CONF alone"
+        return 0
+    }
+    [ -w "$NGINX_CONF" ] && [ -w "$(dirname "$NGINX_CONF")" ] || return 0
+
+    _stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    _keep=$NGINX_BACKUP_DIR/$_stamp
+    _staged=$(mktemp "$(dirname "$NGINX_CONF")/.gatebsd-auth-migrate.XXXXXX") || {
+        warn "cannot stage $NGINX_CONF for auth rate limiting"
+        return 0
+    }
+    if ! awk '
+        BEGIN { inserted = 0 }
+        !inserted && /^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/ {
+            print "    location = /api/auth/login {"
+            print "        limit_req zone=gatebsd_auth burst=5 nodelay;"
+            print "        limit_req_status 429;"
+            print "        proxy_pass http://127.0.0.1:8080;"
+            print "        proxy_http_version 1.1;"
+            print "        proxy_set_header Host $host;"
+            print "        proxy_set_header X-Real-IP $remote_addr;"
+            print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+            print "        proxy_set_header X-Forwarded-Proto $scheme;"
+            print "        proxy_read_timeout 60s;"
+            print "        proxy_send_timeout 60s;"
+            print "    }"
+            print ""
+            inserted = 1
+        }
+        { print }
+    ' "$NGINX_CONF" > "$_staged"; then
+        rm -f "$_staged"
+        warn "cannot insert auth rate-limit block into $NGINX_CONF"
+        return 0
+    fi
+
+    _keep_ok=0
+    if [ "$(uname -s)" = "FreeBSD" ]; then
+        install -d -o root -g wheel -m 0750 "$_keep" && _keep_ok=1 || _keep_ok=0
+    else
+        install -d -m 0750 "$_keep" && _keep_ok=1 || _keep_ok=0
+    fi
+    if [ "$_keep_ok" -eq 0 ] || ! cp -p "$NGINX_CONF" "$_keep/"; then
+        rm -f "$_staged"
+        warn "cannot keep a copy of $NGINX_CONF; leaving it alone"
+        return 0
+    fi
+
+    cat "$_staged" > "$NGINX_CONF"
+    rm -f "$_staged"
+    if nginx -t >/dev/null 2>&1; then
+        echo "gatebsd-config-migrate: enabled /api/auth/login rate limit in $NGINX_CONF"
+    else
+        cat "$_keep/$(basename "$NGINX_CONF")" > "$NGINX_CONF"
+        warn "nginx rejected /api/auth/login rate limit; $NGINX_CONF left unchanged"
+    fi
+}
+
+# ------------------------------------------------------- resolver observability
+# unbound counts how many queries it saw and, without this, nothing else: no
+# rcode breakdown, no cache value, no timings. So "is the filtering working"
+# could only be answered by opinion, and the panel had nothing to show. It
+# counts; it does not record what anybody asked for.
+#
+# New devices get it from unbound.conf.sample. This is for the ones already in
+# the field, whose unbound.conf was installed once and never revisited.
+statistics_enabled() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*extended-statistics:[[:space:]]*yes/ { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$1"
+}
+
+migrate_unbound_statistics() {
+    [ -f "$UNBOUND_CONF" ] && [ ! -L "$UNBOUND_CONF" ] || return 0
+    statistics_enabled "$UNBOUND_CONF" && return 0
+    command -v unbound-checkconf >/dev/null 2>&1 || {
+        warn "unbound-checkconf is unavailable; resolver statistics not enabled"
+        return 0
+    }
+    run_unbound_locked apply_unbound_statistics_locked || warn "Unbound statistics migration failed"
+}
+
+apply_unbound_statistics_locked() {
+    [ -f "$UNBOUND_CONF" ] && [ ! -L "$UNBOUND_CONF" ] || return 0
+    statistics_enabled "$UNBOUND_CONF" && return 0
+    command -v unbound-checkconf >/dev/null 2>&1 || {
+        warn "unbound-checkconf is unavailable; resolver statistics not enabled"
+        return 0
+    }
+
+    _stats_dir=$(dirname "$UNBOUND_CONF")
+    _stats_tmp=$(mktemp "$_stats_dir/.unbound.conf.XXXXXX") || {
+        warn "cannot stage an Unbound configuration; resolver statistics not enabled"
+        return 0
+    }
+    _stats_backup=$(mktemp "$_stats_dir/.unbound.conf.XXXXXX") || {
+        rm -f "$_stats_tmp"
+        warn "cannot stage an Unbound backup; resolver statistics not enabled"
+        return 0
+    }
+
+    # A repeated `server:` clause is how the generated blocklist adds its own
+    # lines as well; unbound merges them.
+    if ! { cp -p "$UNBOUND_CONF" "$_stats_backup" && cat "$UNBOUND_CONF" > "$_stats_tmp" && \
+           printf '\n# GateBSD: count what the resolver does, so the panel can report it\nserver:\n    extended-statistics: yes\n' >> "$_stats_tmp"; }; then
+        rm -f "$_stats_tmp" "$_stats_backup"
+        warn "cannot compose an Unbound configuration; resolver statistics not enabled"
+        return 0
+    fi
+
+    _stats_mode=$(file_perm "$UNBOUND_CONF" || true)
+    case "$_stats_mode" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+        *) _stats_mode=0644 ;;
+    esac
+    if ! { chown root:wheel "$_stats_tmp" && chmod "$_stats_mode" "$_stats_tmp"; }; then
+        rm -f "$_stats_tmp" "$_stats_backup"
+        warn "cannot set permissions on the staged Unbound configuration"
+        return 0
+    fi
+
+    if ! unbound-checkconf "$_stats_tmp" >/dev/null 2>&1; then
+        rm -f "$_stats_tmp" "$_stats_backup"
+        warn "Unbound rejected extended-statistics; configuration left unchanged"
+        return 0
+    fi
+    if ! mv -f "$_stats_tmp" "$UNBOUND_CONF"; then
+        rm -f "$_stats_tmp" "$_stats_backup"
+        warn "cannot publish the Unbound configuration; resolver statistics not enabled"
+        return 0
+    fi
+
+    # Only a running resolver is reloaded. On a fresh install unbound has not
+    # been started yet and the directive applies at first start.
+    if service unbound onestatus >/dev/null 2>&1; then
+        if ! { service unbound reload >/dev/null 2>&1 || service unbound restart >/dev/null 2>&1; }; then
+            warn "Unbound did not accept extended-statistics; restoring previous configuration"
+            cp -p "$_stats_backup" "$UNBOUND_CONF" || warn "failed to restore the previous Unbound configuration"
+            service unbound reload >/dev/null 2>&1 || service unbound restart >/dev/null 2>&1 || \
+                warn "Unbound did not come back after the restore"
+            rm -f "$_stats_backup"
+            return 0
+        fi
+    fi
+    rm -f "$_stats_backup"
+    echo "gatebsd-config-migrate: enabled resolver statistics in $UNBOUND_CONF"
+}
+
+# ------------------------------------------------------------- DoH on port 443
+# Port 53 is redirected here and port 853 is blocked, so a client that wants a
+# resolver of its own has one route left: HTTPS on 443, indistinguishable from
+# any other web request. Nothing closed it -- pf carried no table and no rule
+# for it at all, and the note claiming it was "closed by a list of known
+# endpoints" described a plan rather than the device.
+#
+# What this closes is the closable part: the well-known public resolvers, at
+# stable anycast addresses, listed in doh-endpoints. What it does not close is
+# DoH served from an address that also serves ordinary web content, because
+# blocking those blocks the sites sharing them. That limit is why no CDN range
+# appears in the list, and why this narrows the escape rather than sealing it.
+#
+# QUIC is covered for these addresses -- the rule matches udp as well as tcp --
+# and nowhere else. Blocking all of UDP/443 would force every browser onto TCP,
+# where the endpoint list applies: a real gain, at the price of HTTP/3 for the
+# whole LAN. That is a product decision, not a migration's to take.
+doh_blocking_present() {
+    [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ] || return 0
+    grep -Fq "$PF_DOH_TABLE_MARK" "$PF_CONF" && grep -Fq "$PF_DOH_BLOCK_MARK" "$PF_CONF"
+}
+
+apply_doh_blocking() {
+    [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ] || return 0
+    doh_blocking_present && return 0
+    command -v pfctl >/dev/null 2>&1 || {
+        warn "pfctl is unavailable; DoH blocking not applied"
+        return 0
+    }
+    [ -f "$DOH_ENDPOINTS" ] || {
+        warn "no DoH endpoint list at $DOH_ENDPOINTS; DoH blocking not applied"
+        return 0
+    }
+    run_pf_locked apply_doh_blocking_locked || warn "DoH blocking migration failed"
+}
+
+apply_doh_blocking_locked() {
+    [ -f "$PF_CONF" ] && [ ! -L "$PF_CONF" ] || return 0
+    doh_blocking_present && return 0
+    command -v pfctl >/dev/null 2>&1 || {
+        warn "pfctl is unavailable; DoH blocking not applied"
+        return 0
+    }
+    # pf refuses to load a persist table whose file is missing, and it fails the
+    # whole ruleset doing it -- including the rules that keep this router closed
+    # from the outside. Nothing is written until the list is on disk.
+    [ -f "$DOH_ENDPOINTS" ] || {
+        warn "no DoH endpoint list at $DOH_ENDPOINTS; DoH blocking not applied"
+        return 0
+    }
+
+    # Both anchors have to exist. The table goes with the other tables, and the
+    # rule immediately after `block in all` -- ahead of every `pass ... quick`
+    # that would otherwise match first and leave this one as dead text.
+    if ! grep -q '^[[:space:]]*table <' "$PF_CONF" || \
+       ! grep -q '^[[:space:]]*block in all[[:space:]]*$' "$PF_CONF"; then
+        warn "pf.conf does not have the expected shape; DoH blocking not applied"
+        return 0
+    fi
+
+    _doh_dir=$(dirname "$PF_CONF")
+    _doh_tmp=$(mktemp "$_doh_dir/.pf.conf.XXXXXX") || {
+        warn "cannot stage a pf ruleset; DoH blocking not applied"
+        return 0
+    }
+    _doh_backup=$(mktemp "$_doh_dir/.pf.conf.XXXXXX") || {
+        rm -f "$_doh_tmp"
+        warn "cannot stage a pf backup; DoH blocking not applied"
+        return 0
+    }
+
+    _doh_done=0
+    cp -p "$PF_CONF" "$_doh_backup" || _doh_done=-1
+    if [ "$_doh_done" -eq 0 ]; then
+        awk -v tbl="$PF_DOH_TABLE_MARK" -v blk="$PF_DOH_BLOCK_MARK" '
+            { lines[NR] = $0; if ($0 ~ /^[[:space:]]*table </) last_table = NR }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    print lines[i]
+                    if (i == last_table) {
+                        print ""
+                        print "# GateBSD: public DoH resolvers, the last way out of this resolver"
+                        print tbl
+                    }
+                    if (lines[i] ~ /^[[:space:]]*block in all[[:space:]]*$/) {
+                        print ""
+                        print "# GateBSD: DoH on 443 is DoT with a better disguise"
+                        print blk
+                    }
+                }
+            }
+        ' "$PF_CONF" > "$_doh_tmp" || _doh_done=-1
+    fi
+
+    if [ "$_doh_done" -eq 0 ]; then
+        _doh_mode=$(file_perm "$PF_CONF" || true)
+        case "$_doh_mode" in
+            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+            *) _doh_mode=0600 ;;
+        esac
+        chown root:wheel "$_doh_tmp" && chmod "$_doh_mode" "$_doh_tmp" || _doh_done=-1
+    fi
+
+    if [ "$_doh_done" -eq 0 ]; then
+        if pfctl -nf "$_doh_tmp" >/dev/null 2>&1; then
+            mv -f "$_doh_tmp" "$PF_CONF" && _doh_done=1 || _doh_done=-1
+        else
+            warn "pf rejected the DoH rules; ruleset left unchanged"
+            _doh_done=-1
+        fi
+    fi
+
+    # Written and loaded are separate steps, for the same reason the
+    # interception rules keep them separate: a ruleset that parses but will not
+    # load must not be left on disk for the next boot to find.
+    if [ "$_doh_done" -eq 1 ] && pfctl -s info >/dev/null 2>&1; then
+        if ! pfctl -f "$PF_CONF" >/dev/null 2>&1; then
+            warn "pf did not load the DoH rules; restoring previous ruleset"
+            if cp -p "$_doh_backup" "$PF_CONF"; then
+                pfctl -f "$PF_CONF" >/dev/null 2>&1 || \
+                    warn "ERROR: previous ruleset restored but pf did not load it"
+            else
+                warn "ERROR: failed to restore the previous pf ruleset"
+            fi
+            _doh_done=-1
+        fi
+    fi
+
+    [ "$_doh_done" -eq 1 ] && echo "gatebsd-config-migrate: DoH blocking applied to $PF_CONF"
+    rm -f "$_doh_tmp" "$_doh_backup"
+    return 0
+}
+
+migrate_sudoers_nopasswd() {
+    _sudoers_conf=${GATEBSD_SUDOERS_CONF:-/usr/local/etc/sudoers}
+    _sudoers_backup=${GATEBSD_SUDOERS_BACKUP_DIR:-/var/backups/gatebsd-sudoers}
+    [ -f "$_sudoers_conf" ] && [ ! -L "$_sudoers_conf" ] || return 0
+    awk '$0 == "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" { found=1 } END { exit !found }' "$_sudoers_conf" || return 0
+    command -v visudo >/dev/null 2>&1 || {
+        warn "visudo is unavailable; unattended wheel sudo left unchanged"
+        return 0
+    }
+    _sudoers_dir=$(dirname "$_sudoers_conf")
+    _sudoers_staged=$(mktemp "$_sudoers_dir/.sudoers.XXXXXX") || {
+        warn "cannot stage sudoers; leaving it unchanged"
+        return 0
+    }
+    awk '$0 != "%wheel ALL=(ALL:ALL) NOPASSWD: ALL"' "$_sudoers_conf" > "$_sudoers_staged"
+    if visudo -c -f "$_sudoers_staged" >/dev/null 2>&1; then
+        _sudoers_stamp=$(date '+%Y%m%dT%H%M%S')
+        install -d -o root -g wheel -m 0700 "$_sudoers_backup/$_sudoers_stamp"
+        cp -p "$_sudoers_conf" "$_sudoers_backup/$_sudoers_stamp/sudoers"
+        cat "$_sudoers_staged" > "$_sudoers_conf"
+        echo "gatebsd-config-migrate: removed unattended wheel sudo; password is now required"
+    else
+        warn "visudo rejected the candidate; $_sudoers_conf left unchanged"
+    fi
+    rm -f "$_sudoers_staged"
+    return 0
+}
+
+migrate_sshd_include() {
+    _sshd_conf=${GATEBSD_SSHD_CONF:-/etc/ssh/sshd_config}
+    _sshd_dropin=${GATEBSD_SSHD_GATEBSD_CONF:-/etc/ssh/sshd_config.d/gatebsd.conf}
+    _sshd_backup=${GATEBSD_SSHD_BACKUP_DIR:-/var/backups/gatebsd-sshd}
+    _sshd_include='Include /etc/ssh/sshd_config.d/*.conf'
+    [ -f "$_sshd_conf" ] && [ ! -L "$_sshd_conf" ] || return 0
+    _sshd_uid=$(file_uid "$_sshd_conf" || printf '%s' -1)
+    [ "$_sshd_uid" = 0 ] || {
+        warn "leaving non-root-owned sshd_config alone: $_sshd_conf"
+        return 0
+    }
+    _need_include=0
+    if ! awk -v wanted="$_sshd_include" '$0 == wanted { found=1 } END { exit !found }' "$_sshd_conf"; then
+        _need_include=1
+    fi
+    _retire_allowusers=0
+    if [ ! -e "$_sshd_dropin" ] || awk 'tolower($1) == "allowgroups" { found=1 } END { exit !found }' "$_sshd_dropin" 2>/dev/null; then
+        if awk '
+            BEGIN { in_match = 0; found = 0 }
+            /^[[:space:]]*(#|$)/ { next }
+            {
+                key = tolower($1)
+                if (key == "match") in_match = 1
+                else if (!in_match && key == "allowusers") found = 1
+            }
+            END { exit !found }
+        ' "$_sshd_conf"; then
+            _retire_allowusers=1
+        fi
+    fi
+    if [ "$_need_include" -eq 0 ] && [ "$_retire_allowusers" -eq 0 ]; then
+        return 0
+    fi
+    command -v sshd >/dev/null 2>&1 || {
+        warn "sshd is unavailable to validate the Include; leaving $_sshd_conf alone"
+        return 0
+    }
+    _sshd_dir=$(dirname "$_sshd_conf")
+    _sshd_staged=$(mktemp "$_sshd_dir/.sshd_config.XXXXXX") || {
+        warn "cannot stage sshd_config; leaving it unchanged"
+        return 0
+    }
+    _sshd_publish=$(mktemp "$_sshd_dir/.sshd_config.pub.XXXXXX") || {
+        rm -f "$_sshd_staged"
+        warn "cannot stage sshd_config publish copy; leaving it unchanged"
+        return 0
+    }
+    if [ "$_need_include" -eq 1 ]; then
+        printf '%s\n' "$_sshd_include" > "$_sshd_staged"
+    else
+        : > "$_sshd_staged"
+    fi
+    if [ "$_retire_allowusers" -eq 1 ]; then
+        awk '
+            BEGIN { in_match = 0 }
+            /^[[:space:]]*#/ { print; next }
+            {
+                if (NF > 0) {
+                    key = tolower($1)
+                    if (key == "match") in_match = 1
+                    else if (!in_match && key == "allowusers") next
+                }
+                print
+            }
+        ' "$_sshd_conf" >> "$_sshd_staged"
+    else
+        cat "$_sshd_conf" >> "$_sshd_staged"
+    fi
+    if sshd -t -f "$_sshd_staged" >/dev/null 2>&1; then
+        _sshd_stamp=$(date '+%Y%m%dT%H%M%S')
+        install -d -o root -g wheel -m 0700 "$_sshd_backup/$_sshd_stamp"
+        cp -p "$_sshd_conf" "$_sshd_backup/$_sshd_stamp/sshd_config"
+        if cp -p "$_sshd_conf" "$_sshd_publish" && cat "$_sshd_staged" > "$_sshd_publish" && mv -f "$_sshd_publish" "$_sshd_conf"; then
+            :
+        else
+            cat "$_sshd_staged" > "$_sshd_conf"
+        fi
+        if [ "$_retire_allowusers" -eq 1 ]; then
+            echo "gatebsd-config-migrate: enabled managed SSH hardening and retired global AllowUsers in $_sshd_conf"
+        else
+            echo "gatebsd-config-migrate: enabled managed SSH hardening in $_sshd_conf"
+        fi
+        if service sshd onestatus >/dev/null 2>&1; then
+            service sshd reload >/dev/null 2>&1 || warn "sshd did not reload after updating $_sshd_conf"
+        fi
+    else
+        warn "sshd rejected the managed candidate; $_sshd_conf left unchanged"
+    fi
+    rm -f "$_sshd_staged" "$_sshd_publish"
+    return 0
+}
+
+migrate_unbound_anchor() {
+    _anchor_conf=$UNBOUND_CONF
+    [ -f "$_anchor_conf" ] && [ ! -L "$_anchor_conf" ] || return 0
+    if ! sysrc unbound_anchorflags="-a /usr/local/etc/unbound/state/root.key"; then
+        warn "cannot pin unbound-anchor to the managed trust anchor; leaving configuration unchanged"
+        return 0
+    fi
+    awk '/^[[:space:]]*auto-trust-anchor-file:[[:space:]]*"\/state\/root.key"/ { found=1 } END { exit !found }' "$_anchor_conf" && return 0
+    run_unbound_locked apply_unbound_anchor_locked || warn "Unbound trust anchor migration failed"
+}
+
+apply_unbound_anchor_locked() {
+    _anchor_conf=$UNBOUND_CONF
+    _anchor_state=${GATEBSD_UNBOUND_STATE_DIR:-/usr/local/etc/unbound/state}
+    [ -f "$_anchor_conf" ] && [ ! -L "$_anchor_conf" ] || return 0
+    awk '/^[[:space:]]*auto-trust-anchor-file:[[:space:]]*"\/state\/root.key"/ { found=1 } END { exit !found }' "$_anchor_conf" && return 0
+    if [ ! -e "$_anchor_state" ]; then
+        install -d -o unbound -g unbound -m 0750 "$_anchor_state" || {
+            warn "cannot create Unbound state directory: $_anchor_state"
+            return 0
+        }
+    fi
+    [ -d "$_anchor_state" ] && [ ! -L "$_anchor_state" ] || {
+        warn "Unbound state directory is missing or unsafe: $_anchor_state"
+        return 0
+    }
+    if [ -L "$_anchor_state/root.key" ]; then
+        warn "Unbound trust anchor is a symlink; refusing to touch $_anchor_state/root.key"
+        return 0
+    fi
+    if [ -e "$_anchor_state/root.key" ] && [ "$(file_links "$_anchor_state/root.key")" -ne 1 ]; then
+        warn "Unbound trust anchor has hardlinks; refusing to touch $_anchor_state/root.key"
+        return 0
+    fi
+    if [ ! -f "$_anchor_state/root.key" ]; then
+        _anchor_legacy=${GATEBSD_UNBOUND_LEGACY_ANCHOR:-/usr/local/etc/unbound/root.key}
+        if [ ! -f "$_anchor_legacy" ] && [ -f /var/unbound/root.key ]; then
+            _anchor_legacy=/var/unbound/root.key
+        fi
+        if [ -f "$_anchor_legacy" ] && [ ! -L "$_anchor_legacy" ]; then
+            install -o unbound -g unbound -m 0640 "$_anchor_legacy" "$_anchor_state/root.key" || {
+                warn "cannot seed the Unbound trust anchor"
+                return 0
+            }
+        else
+            install -o unbound -g unbound -m 0640 /dev/null "$_anchor_state/root.key" || {
+                warn "cannot initialize the Unbound trust anchor"
+                return 0
+            }
+        fi
+    fi
+    command -v unbound-checkconf >/dev/null 2>&1 || {
+        warn "unbound-checkconf is unavailable; trust anchor path left unchanged"
+        return 0
+    }
+    case "$_anchor_state" in
+        *"'"*|*[[:cntrl:]]*) warn "unsafe Unbound state directory path: $_anchor_state"; return 0 ;;
+    esac
+    ANCHOR_STATE="$_anchor_state" su -m unbound -c 'test -w "$ANCHOR_STATE"' >/dev/null 2>&1 || {
+        warn "Unbound cannot write its trust anchor in $_anchor_state"
+        return 0
+    }
+    _anchor_dir=$(dirname "$_anchor_conf")
+    _anchor_tmp=$(mktemp "$_anchor_dir/.unbound-anchor.XXXXXX") || {
+        warn "cannot stage Unbound trust anchor config"
+        return 0
+    }
+    _anchor_backup=$(mktemp "$_anchor_dir/.unbound-anchor-backup.XXXXXX") || {
+        rm -f "$_anchor_tmp"
+        warn "cannot keep an Unbound trust anchor backup"
+        return 0
+    }
+    cp -p "$_anchor_conf" "$_anchor_backup"
+    awk '
+        /^[[:space:]]*auto-trust-anchor-file:/ { next }
+        /^[[:space:]]*username:/ && !written {
+            print
+            print "    auto-trust-anchor-file: \"/state/root.key\""
+            written=1
+            next
+        }
+        { print }
+    ' "$_anchor_conf" > "$_anchor_tmp"
+    if ! unbound-checkconf "$_anchor_tmp" >/dev/null 2>&1; then
+        warn "Unbound rejected the trust anchor path; configuration left unchanged"
+        rm -f "$_anchor_tmp" "$_anchor_backup"
+        return 0
+    fi
+    _anchor_mode=$(file_perm "$_anchor_conf" || true)
+    case "$_anchor_mode" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+        *) _anchor_mode=0644 ;;
+    esac
+    chown root:wheel "$_anchor_tmp" && chmod "$_anchor_mode" "$_anchor_tmp" || {
+        rm -f "$_anchor_tmp" "$_anchor_backup"
+        return 0
+    }
+    if ! mv -f "$_anchor_tmp" "$_anchor_conf"; then
+        rm -f "$_anchor_tmp" "$_anchor_backup"
+        return 0
+    fi
+    if service unbound onestatus >/dev/null 2>&1; then
+        if ! { service unbound reload >/dev/null 2>&1 || service unbound restart >/dev/null 2>&1; }; then
+            warn "Unbound did not accept the trust anchor path; restoring previous configuration"
+            cp -p "$_anchor_backup" "$_anchor_conf"
+            service unbound restart >/dev/null 2>&1 || true
+        fi
+    fi
+    rm -f "$_anchor_backup"
+    echo "gatebsd-config-migrate: moved the DNSSEC trust anchor to $_anchor_state/root.key"
+    return 0
+}
+
+migrate_sysctl_hardening() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    [ -f "$SYSCTL_CONF" ] && [ ! -L "$SYSCTL_CONF" ] && [ "$(file_links "$SYSCTL_CONF")" -eq 1 ] || return 0
+    if [ -z "${GATEBSD_SYSCTL_CONF:-}" ]; then
+        [ "$(file_uid "$SYSCTL_CONF" || printf '%s' -1)" = 0 ] || {
+            warn "sysctl.conf is not root-owned; hardlink hardening left unchanged"
+            return 0
+        }
+    fi
+
+    _need_uid=0
+    _need_gid=0
+    grep -Eq '^[[:space:]]*security\.bsd\.hardlink_check_uid[[:space:]]*=[[:space:]]*1([[:space:]#]|$)' "$SYSCTL_CONF" || _need_uid=1
+    grep -Eq '^[[:space:]]*security\.bsd\.hardlink_check_gid[[:space:]]*=[[:space:]]*1([[:space:]#]|$)' "$SYSCTL_CONF" || _need_gid=1
+
+    if [ "$_need_uid" -eq 1 ] || [ "$_need_gid" -eq 1 ]; then
+        _sys_dir=$(dirname "$SYSCTL_CONF")
+        [ -w "$_sys_dir" ] && [ -w "$SYSCTL_CONF" ] || return 0
+        _sys_tmp=$(mktemp "$_sys_dir/.sysctl.conf.XXXXXX") || {
+            warn "cannot stage $SYSCTL_CONF; leaving hardlink hardening unchanged"
+            return 0
+        }
+        if ! awk '1' "$SYSCTL_CONF" > "$_sys_tmp"; then
+            rm -f "$_sys_tmp"
+            return 0
+        fi
+        if [ "$_need_uid" -eq 1 ]; then
+            printf '%s\n' 'security.bsd.hardlink_check_uid=1' >> "$_sys_tmp"
+        fi
+        if [ "$_need_gid" -eq 1 ]; then
+            printf '%s\n' 'security.bsd.hardlink_check_gid=1' >> "$_sys_tmp"
+        fi
+        _sys_mode=$(file_perm "$SYSCTL_CONF" || true)
+        case "$_sys_mode" in
+            [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+            *) _sys_mode=0644 ;;
+        esac
+        chmod "$_sys_mode" "$_sys_tmp" || { rm -f "$_sys_tmp"; return 0; }
+        if [ -z "${GATEBSD_SYSCTL_CONF:-}" ] || [ "$(uname -s)" = "FreeBSD" ]; then
+            chown root:wheel "$_sys_tmp" || { rm -f "$_sys_tmp"; return 0; }
+        fi
+        mv -f "$_sys_tmp" "$SYSCTL_CONF"
+        echo "gatebsd-config-migrate: enabled hardlink protections in $SYSCTL_CONF"
+    fi
+
+    if [ "$(uname -s)" = "FreeBSD" ] && command -v sysctl >/dev/null 2>&1; then
+        sysctl security.bsd.hardlink_check_uid=1 security.bsd.hardlink_check_gid=1 >/dev/null 2>&1 || true
+    fi
+}
+
+migrate_failover_retired_keys() {
+    [ -f "$FAILOVER_CONF" ] && [ ! -L "$FAILOVER_CONF" ] && [ "$(file_links "$FAILOVER_CONF")" -eq 1 ] || return 0
+    grep -Eq '^[[:space:]]*(STATE_FILE|LOCK_FILE|VPN_FAILURE_POLICY)[[:space:]]*=' "$FAILOVER_CONF" || return 0
+    _fo_dir=$(dirname "$FAILOVER_CONF")
+    [ -w "$_fo_dir" ] && [ -w "$FAILOVER_CONF" ] || return 0
+    _fo_tmp=$(mktemp "$_fo_dir/.failover.conf.XXXXXX") || return 0
+    if awk '!/^[[:space:]]*(STATE_FILE|LOCK_FILE|VPN_FAILURE_POLICY)[[:space:]]*=/' "$FAILOVER_CONF" > "$_fo_tmp" \
+        && chown root:wheel "$_fo_tmp" \
+        && chmod 0600 "$_fo_tmp" \
+        && mv -f "$_fo_tmp" "$FAILOVER_CONF"; then
+        echo "gatebsd-config-migrate: retired legacy STATE_FILE/LOCK_FILE/VPN_FAILURE_POLICY keys from $FAILOVER_CONF"
+    else
+        rm -f "$_fo_tmp"
+    fi
+}
+
+if [ -n "$LOCKED_STEP" ]; then
+    case "$LOCKED_STEP" in
+        apply_unbound_statistics_locked|apply_unbound_anchor_locked|apply_dns_interception_locked|apply_doh_blocking_locked|apply_dns_canary)
+            "$LOCKED_STEP"
+            exit $?
+            ;;
+        *) fail "unknown --locked-step: $LOCKED_STEP" ;;
+    esac
+fi
+
+migrate_one "$MAIN_CONF" 0640
+migrate_one "$FAILOVER_CONF" 0600
+migrate_failover_retired_keys
+migrate_one "$SPLIT_DNS_CONF" 0600
+migrate_one "$GATEWAY_CONF" 0600
+migrate_one "$LOG_DIR/gatebsd-ui.log" 0600
+migrate_one "$LOG_DIR/gatebsd-recovery.log" 0600
+migrate_route_state
+migrate_ui_data_dir
+migrate_rc_directory
+migrate_sudoers_nopasswd
+migrate_sshd_include
+migrate_nginx_listen
+migrate_nginx_auth_limit
+migrate_unbound_statistics
+migrate_unbound_anchor
+migrate_dns_canary
+migrate_split_dns
+apply_dns_interception
+apply_doh_blocking
+migrate_sysctl_hardening
+migrate_system_prefixes

@@ -1,0 +1,3 @@
+# Install as /usr/local/etc/gatebsd/duckdns.conf, root:wheel mode 0600.
+GATEBSD_TLS_DOMAIN="your-domain.duckdns.org"
+DuckDNS_Token="replace-with-the-duckdns-token"

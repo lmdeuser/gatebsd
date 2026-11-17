@@ -1,0 +1,112 @@
+#!/bin/sh
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+CONF=${GATEBSD_FAILOVER_CONF:-/usr/local/etc/gatebsd/failover.conf}
+STATE=${GATEBSD_FAILOVER_STATE:-/var/run/gatebsd/watchdog.json}
+REQUEST=${GATEBSD_MANUAL_WAN_FILE:-/var/run/gatebsd/manual-wan}
+LOCK_FILE=${GATEBSD_FAILOVERCTL_LOCK:-/var/run/gatebsd/failoverctl.lock}
+cmd=${1:-status}
+
+require_root() { [ "$(id -u)" -eq 0 ] || { echo "root required" >&2; exit 1; }; }
+
+# Create the shared runtime directory if it is missing, and otherwise leave its
+# ownership alone.
+#
+# /var/run/gatebsd is not this tool's private directory: the agent's unix socket
+# lives there, and the web UI runs as the unprivileged service account, which
+# needs the group's traverse bit to reach it. Two `install -d -o root -g wheel`
+# calls here used to reset the group on every non-status invocation -- switching
+# WAN mode from the admin panel was enough -- after which the UI answered
+# "agent unavailable" to every request until something recreated the directory.
+# Validate what is already there; never re-own it.
+ensure_runtime_dir() {
+    _dir=$1
+    if [ -d "$_dir" ] && [ ! -L "$_dir" ]; then
+        _dir_uid=$(stat -f '%u' "$_dir" 2>/dev/null || printf '%s' -1)
+        [ "$_dir_uid" = 0 ] || { echo "runtime directory must be root-owned: $_dir" >&2; exit 1; }
+        _dir_mode=$(stat -f '%Lp' "$_dir" 2>/dev/null || printf '%s' 777)
+        case "$_dir_mode" in
+            *[2367][0-7]|*[0-7][2367]) echo "runtime directory must not be group/world writable: $_dir" >&2; exit 1 ;;
+        esac
+        return 0
+    fi
+    [ ! -e "$_dir" ] && [ ! -L "$_dir" ] || { echo "unsafe runtime directory: $_dir" >&2; exit 1; }
+    install -d -o root -g "${GATEBSD_SERVICE_GROUP:-gatebsd}" -m 0750 "$_dir"
+}
+validate_config() {
+    [ -f "$CONF" ] && [ ! -L "$CONF" ] || { echo "unsafe or missing failover config: $CONF" >&2; exit 1; }
+    _uid=$(stat -f '%u' "$CONF" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$CONF" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || { echo "failover config must be owned by root" >&2; exit 1; }
+    case "$_mode" in *[2367][0-7]|*[0-7][2367]) echo "failover config must not be group/world writable" >&2; exit 1 ;; esac
+}
+
+if [ "$cmd" != status ] && [ "${GATEBSD_FAILOVERCTL_LOCK_HELD:-0}" != 1 ]; then
+    require_root
+    ensure_runtime_dir "$(dirname "$LOCK_FILE")"
+    exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_FAILOVERCTL_LOCK_HELD=1 \
+        GATEBSD_FAILOVER_CONF="$CONF" \
+        GATEBSD_FAILOVER_STATE="$STATE" \
+        GATEBSD_MANUAL_WAN_FILE="$REQUEST" \
+        GATEBSD_FAILOVERCTL_LOCK="$LOCK_FILE" \
+        lockf -t 5 "$LOCK_FILE" "$0" "$@"
+fi
+
+write_mode() {
+    mode=$1
+    validate_config
+    dir=$(dirname "$CONF")
+    tmp=$(mktemp "$dir/.failover.conf.XXXXXX")
+    cleanup_mode() { rm -f "$tmp"; }
+    trap cleanup_mode EXIT HUP INT TERM
+    awk -v m="$mode" '
+        BEGIN { done=0 }
+        /^FAILOVER_MODE=/ { print "FAILOVER_MODE=\"" m "\""; done=1; next }
+        { print }
+        END { if (!done) print "FAILOVER_MODE=\"" m "\"" }
+    ' "$CONF" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$CONF"
+    trap - EXIT HUP INT TERM
+    cleanup_mode
+}
+
+write_request() {
+    target=$1
+    request_id=$2
+    dir=$(dirname "$REQUEST")
+    ensure_runtime_dir "$dir"
+    if [ -e "$REQUEST" ] && { [ -L "$REQUEST" ] || [ ! -f "$REQUEST" ]; }; then
+        echo "unsafe request path: $REQUEST" >&2
+        exit 1
+    fi
+    tmp=$(mktemp "$dir/.manual-wan.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT HUP INT TERM
+    printf '%s %s\n' "$target" "$request_id" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$REQUEST"
+    trap - EXIT HUP INT TERM
+}
+
+case "$cmd" in
+    status)
+        if [ -r "$STATE" ] && [ -f "$STATE" ] && [ ! -L "$STATE" ]; then cat "$STATE"; else echo '{"state":"UNKNOWN"}'; fi
+        ;;
+    observe|automatic|manual)
+        write_mode "$cmd"
+        echo "Failover mode set to $cmd"
+        ;;
+    primary|backup)
+        validate_config
+        mode=$(sed -n 's/^FAILOVER_MODE="\{0,1\}\([^" ]*\).*/\1/p' "$CONF" | head -n 1)
+        [ "$mode" = manual ] || { echo "set manual mode first" >&2; exit 1; }
+        request_id="$(date +%s)-$$"
+        write_request "$cmd" "$request_id"
+        service gatebsd_failover status >/dev/null 2>&1 || service gatebsd_failover start >/dev/null 2>&1
+        logger -t gatebsd-failoverctl "manual WAN request $request_id is pending ($cmd)" 2>/dev/null || true
+        printf 'pending request_id=%s target=%s\n' "$request_id" "$cmd"
+        ;;
+    *) echo "Usage: gatebsd-failoverctl {status|observe|automatic|manual|primary|backup}" >&2; exit 2 ;;
+esac

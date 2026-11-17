@@ -1,0 +1,2 @@
+# NUT mode: netserver — listen on network for TCP clients
+MODE=netserver

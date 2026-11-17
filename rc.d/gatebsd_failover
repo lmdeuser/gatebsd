@@ -1,0 +1,165 @@
+#!/bin/sh
+# PROVIDE: gatebsd_failover
+# REQUIRE: NETWORKING gatebsd_lock_cleanup pf gatewayctl_apply
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="gatebsd_failover"
+rcvar="gatebsd_failover_enable"
+desc="GateBSD WAN and VPN failover watchdog"
+pidfile="/var/run/gatebsd/watchdog.pid"
+# daemon(8) records its own pid here. The watchdog writes the pidfile above
+# itself, from inside the lockf re-exec, so the two are different processes and
+# the stop path has to know which one it is talking to.
+supervisor_pidfile="/var/run/gatebsd/watchdog-supervisor.pid"
+start_cmd="gatebsd_failover_start"
+stop_cmd="gatebsd_failover_stop"
+status_cmd="gatebsd_failover_status"
+
+
+_prepare_runtime_dir() {
+    _dir=${pidfile%/*}
+    if [ -e "$_dir" ] || [ -L "$_dir" ]; then
+        [ -d "$_dir" ] && [ ! -L "$_dir" ] || { echo "Unsafe GateBSD runtime directory: $_dir" >&2; return 1; }
+        _uid=$(stat -f '%u' "$_dir" 2>/dev/null || printf '%s' -1)
+        _mode=$(stat -f '%Lp' "$_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_uid" = 0 ] || { echo "GateBSD runtime directory must be root-owned" >&2; return 1; }
+        case "$_mode" in *[2367][0-7]|*[0-7][2367]) echo "GateBSD runtime directory must not be group/world writable" >&2; return 1 ;; esac
+    else
+        install -d -o root -g gatebsd -m 0750 "$_dir"
+    fi
+}
+
+_valid_pid() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ] 2>/dev/null || return 1
+    _command=$(ps -p "$1" -o command= 2>/dev/null || true)
+    # daemon(8) reports itself as "daemon: /path/to/gatebsd-watchdog.sh[pid]",
+    # which contains the script name too. PIDs get recycled, so a supervisor
+    # accepted here as the watchdog would have the stop path signal the wrong
+    # process; the two are told apart explicitly.
+    case "$_command" in
+        daemon:*) return 1 ;;
+        *gatebsd-watchdog.sh*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_valid_supervisor_pid() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -gt 1 ] 2>/dev/null || return 1
+    _command=$(ps -p "$1" -o command= 2>/dev/null || true)
+    case "$_command" in
+        daemon:*gatebsd-watchdog.sh*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_read_pid() {
+    [ -f "$pidfile" ] && [ ! -L "$pidfile" ] || return 1
+    _pid=$(sed -n '1p' "$pidfile" 2>/dev/null | tr -d '[:space:]')
+    _valid_pid "$_pid" || return 1
+    printf '%s\n' "$_pid"
+}
+
+_read_supervisor_pid() {
+    [ -f "$supervisor_pidfile" ] && [ ! -L "$supervisor_pidfile" ] || return 1
+    _pid=$(sed -n '1p' "$supervisor_pidfile" 2>/dev/null | tr -d '[:space:]')
+    _valid_supervisor_pid "$_pid" || return 1
+    printf '%s\n' "$_pid"
+}
+
+gatebsd_failover_start() {
+    _prepare_runtime_dir || return 1
+    if _pid=$(_read_pid) && kill -0 "$_pid" 2>/dev/null; then
+        echo "gatebsd-watchdog is already running as pid $_pid"
+        return 0
+    fi
+    rm -f "$pidfile"
+    echo "Starting gatebsd-watchdog."
+    # Supervised, because this is the one process on the device that must never
+    # be absent: it is what notices a dead uplink. On 31 July the instance a
+    # package upgrade had just started disappeared inside a minute, silently,
+    # and the router ran without failover until a human looked. Whatever ends it
+    # -- an unguarded command under `set -e`, a signal, a kernel-level kill --
+    # daemon(8) starts it again after the delay below.
+    #
+    # Verified on FreeBSD 15.1 rather than assumed: -r restarts the child on
+    # *any* exit, including status 0, so the stop path must signal the
+    # supervisor and not the watchdog (a TERM to the child alone is undone by a
+    # restart within a second). TERM to the supervisor does reach the child, so
+    # its own trap still runs and still records the stop.
+    /usr/sbin/daemon -f -r -R 5 -P "$supervisor_pidfile" \
+        -o /var/log/gatebsd-watchdog.log \
+        /usr/local/sbin/gatebsd-watchdog.sh
+    _wait=0
+    while [ "$_wait" -lt 20 ]; do
+        if _pid=$(_read_pid) && kill -0 "$_pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+        _wait=$((_wait + 1))
+    done
+    echo "gatebsd-watchdog did not create a valid pidfile" >&2
+    return 1
+}
+
+gatebsd_failover_stop() {
+    _supervisor=$(_read_supervisor_pid) || _supervisor=''
+    _pid=$(_read_pid) || _pid=''
+    if [ -z "$_supervisor" ] && [ -z "$_pid" ]; then
+        rm -f "$pidfile" "$supervisor_pidfile"
+        echo "gatebsd-watchdog is not running"
+        return 0
+    fi
+    echo "Stopping gatebsd-watchdog."
+    # The supervisor first, and only then the watchdog. In the other order the
+    # supervisor would simply start a fresh watchdog five seconds later and the
+    # stop would look like it had worked. Signalling the supervisor also lets
+    # the watchdog's own TERM trap run, which is what records the stop in the
+    # state file.
+    if [ -n "$_supervisor" ]; then
+        kill -TERM "$_supervisor" 2>/dev/null || true
+        _wait=0
+        while kill -0 "$_supervisor" 2>/dev/null && [ "$_wait" -lt 15 ]; do
+            sleep 1
+            _wait=$((_wait + 1))
+        done
+    fi
+    # A watchdog started before this version -- or one that outlived its
+    # supervisor -- still has to be stopped.
+    if [ -n "$_pid" ] || _pid=$(_read_pid); then
+        kill -TERM "$_pid" 2>/dev/null || true
+        _wait=0
+        while kill -0 "$_pid" 2>/dev/null && [ "$_wait" -lt 15 ]; do
+            sleep 1
+            _wait=$((_wait + 1))
+        done
+        if kill -0 "$_pid" 2>/dev/null; then
+            kill -KILL "$_pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$pidfile" "$supervisor_pidfile"
+}
+
+gatebsd_failover_status() {
+    if _pid=$(_read_pid) && kill -0 "$_pid" 2>/dev/null; then
+        echo "gatebsd-watchdog is running as pid $_pid"
+        return 0
+    fi
+    # Still a failure: for the seconds between a death and the restart there is
+    # no failover, and a caller polling this must not be told otherwise. But say
+    # which of the two situations it is -- "not running, and nothing will start
+    # it" and "down, supervised, back shortly" call for different reactions.
+    if _supervisor=$(_read_supervisor_pid); then
+        echo "gatebsd-watchdog is down; supervisor pid $_supervisor will restart it"
+        return 1
+    fi
+    echo "gatebsd-watchdog is not running"
+    return 1
+}
+
+load_rc_config "$name"
+: ${gatebsd_failover_enable:="NO"}
+run_rc_command "$1"

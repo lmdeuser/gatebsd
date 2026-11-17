@@ -1,0 +1,75 @@
+APP_NAME = Home Forge
+RUN_MODE = prod
+RUN_USER = git
+
+[database]
+DB_TYPE = sqlite3
+PATH = /var/db/forgejo/forgejo.db
+
+[indexer]
+ISSUE_INDEXER_PATH = /var/db/forgejo/indexers/issues.bleve
+
+[log]
+LEVEL = Info
+MODE = file
+ROOT_PATH = /var/log/forgejo
+
+[repository]
+ROOT = /var/db/forgejo/forgejo-repositories
+SCRIPT_TYPE = sh
+DEFAULT_PRIVATE = private
+
+[repository.upload]
+TEMP_PATH = /var/db/forgejo/data/tmp/uploads
+FILE_MAX_SIZE = 64
+MAX_FILES = 10
+
+[security]
+INSTALL_LOCK = true
+INTERNAL_TOKEN = %%INTERNAL_TOKEN%%
+SECRET_KEY = %%SECRET_KEY%%
+LOGIN_REMEMBER_DAYS = 14
+
+[oauth2]
+JWT_SECRET = %%JWT_SECRET%%
+
+[session]
+PROVIDER = file
+PROVIDER_CONFIG = /var/db/forgejo/data/sessions
+COOKIE_SECURE = true
+
+[server]
+APP_DATA_PATH = /var/db/forgejo/data
+DOMAIN = git.example.lan
+HTTP_ADDR = 127.0.0.1
+HTTP_PORT = 3000
+ROOT_URL = https://git.example.lan/forgejo/
+PROTOCOL = http
+OFFLINE_MODE = false
+DISABLE_SSH = false
+START_SSH_SERVER = true
+SSH_DOMAIN = git.example.lan
+SSH_LISTEN_HOST = 0.0.0.0
+SSH_LISTEN_PORT = 2222
+SSH_PORT = 2222
+LFS_START_SERVER = true
+
+[service]
+DISABLE_REGISTRATION = true
+ENABLE_CAPTCHA = true
+ENABLE_NOTIFY_MAIL = false
+REGISTER_EMAIL_CONFIRM = false
+REQUIRE_SIGNIN_VIEW = true
+
+[actions]
+ENABLED = true
+DEFAULT_ACTIONS_URL = https://data.forgejo.org
+LOG_RETENTION_DAYS = 30
+ARTIFACT_RETENTION_DAYS = 30
+
+[picture]
+DISABLE_GRAVATAR = true
+ENABLE_FEDERATED_AVATAR = false
+
+[metrics]
+ENABLED = false

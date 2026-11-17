@@ -1,0 +1,3 @@
+# Monthly bounded UPS self-test is opt-in: create ups-autotest.enabled after a
+# supervised real test proves that this UPS/driver reports CAL/OB/DISCHRG.
+30 3 1 * * root test -f /usr/local/etc/gatebsd/ups-autotest.enabled && /usr/local/sbin/gatebsd-ups-test.sh

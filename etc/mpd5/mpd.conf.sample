@@ -1,0 +1,34 @@
+default:
+    create bundle static B1
+
+    # MSS clamping (duplicates PF scrub safely)
+    set iface enable tcpmssfix
+
+    # IMPORTANT: routing is managed by watchdog and gatewayctl
+    # set iface route default  <-- omitted intentionally
+
+    # Address range assigned by ISP
+    set ipcp ranges 0.0.0.0/0 0.0.0.0/0
+
+    create link static L1 pppoe
+    set link action bundle B1
+
+    # Fill in your ISP credentials
+    set auth authname "YOUR_ISP_USERNAME"
+    set auth password "YOUR_ISP_PASSWORD"
+
+    # Unlimited reconnects with 5s delay
+    set link max-redial 0
+    set link redial-delay 5
+
+    # Keepalive: every 10s, 60s timeout
+    set link keep-alive 10 60
+
+    # Standard PPPoE MTU/MRU
+    set link mtu 1492
+    set link mru 1492
+
+    set pppoe iface re0
+    set pppoe service ""
+
+    open

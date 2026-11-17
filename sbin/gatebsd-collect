@@ -1,0 +1,448 @@
+#!/bin/sh
+#
+# GateBSD diagnostics collector for an existing FreeBSD gateway.
+# Collects configuration and runtime state without changing the system.
+# Secrets are redacted by default.
+#
+# Usage:
+#   sudo sh gatebsd-collect.sh
+#   sudo sh gatebsd-collect.sh --output /root
+#
+# Result:
+#   gatebsd-report-<hostname>-<timestamp>.tar.gz
+#
+
+set -eu
+
+VERSION="1.0.0"
+OUTPUT_DIR="/tmp"
+KEEP_DIR=0
+INCLUDE_LOGS=1
+MAX_LOG_LINES=500
+MAX_FILE_SIZE=$((2 * 1024 * 1024))
+HOST_RAW="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+HOST="$(printf '%s' "$HOST_RAW" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-64)"
+[ -n "$HOST" ] || HOST=unknown
+STAMP="$(date '+%Y%m%d-%H%M%S')"
+WORKDIR=""
+ARCHIVE_NAME="gatebsd-report-${HOST}-${STAMP}-$$.tar.gz"
+ARCHIVE_PATH=""
+
+usage() {
+    cat <<EOF
+GateBSD diagnostics collector ${VERSION}
+
+Usage:
+  $0 [options]
+
+Options:
+  --output DIR       Directory for resulting archive (default: /tmp)
+  --no-logs          Do not collect log excerpts
+  --keep-dir         Keep unpacked report directory
+  --help             Show this help
+
+The script does not modify network, PF, routes, services or configuration.
+Passwords, private keys, tokens and common credentials are redacted.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output)
+            [ "$#" -ge 2 ] || { echo "Missing value for --output" >&2; exit 2; }
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --no-logs)
+            INCLUDE_LOGS=0
+            shift
+            ;;
+        --keep-dir)
+            KEEP_DIR=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run as root: sudo sh $0" >&2
+    exit 1
+fi
+
+if [ ! -d "$OUTPUT_DIR" ] || [ ! -w "$OUTPUT_DIR" ] || [ -L "$OUTPUT_DIR" ]; then
+    echo "Output directory is missing, unsafe, or not writable: $OUTPUT_DIR" >&2
+    exit 1
+fi
+OUTPUT_DIR="$(CDPATH= cd -- "$OUTPUT_DIR" && pwd -P)"
+STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gatebsd-report.XXXXXX")" || exit 1
+chmod 700 "$STAGE_ROOT"
+WORKDIR="${STAGE_ROOT}/${ARCHIVE_NAME%.tar.gz}"
+mkdir -m 0700 "$WORKDIR" || exit 1
+ARCHIVE_PATH="${OUTPUT_DIR%/}/${ARCHIVE_NAME}"
+ARCHIVE_TMP="${STAGE_ROOT}/.${ARCHIVE_NAME}.tmp"
+[ ! -e "$ARCHIVE_PATH" ] && [ ! -L "$ARCHIVE_PATH" ] || { echo "Refusing existing archive: $ARCHIVE_PATH" >&2; exit 1; }
+
+cleanup() {
+    if [ "$KEEP_DIR" -eq 0 ] && [ -n "${STAGE_ROOT:-}" ] && [ -d "$STAGE_ROOT" ]; then
+        rm -rf "$STAGE_ROOT"
+    elif [ -n "${ARCHIVE_TMP:-}" ]; then
+        rm -f -- "$ARCHIVE_TMP"
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+mkdir -p \
+    "$WORKDIR/system" \
+    "$WORKDIR/network" \
+    "$WORKDIR/pf" \
+    "$WORKDIR/services" \
+    "$WORKDIR/config" \
+    "$WORKDIR/vpn" \
+    "$WORKDIR/failover" \
+    "$WORKDIR/packages" \
+    "$WORKDIR/logs" \
+    "$WORKDIR/meta"
+
+chmod 700 "$WORKDIR"
+
+log() {
+    printf '%s\n' "$*"
+}
+
+write_header() {
+    file="$1"
+    title="$2"
+    {
+        echo "# GateBSD diagnostic report"
+        echo "# Section: $title"
+        echo "# Host: $HOST"
+        echo "# Created: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo
+    } > "$file"
+}
+
+run_cmd() {
+    outfile="$1"
+    title="$2"
+    shift 2
+
+    write_header "$outfile" "$title"
+    {
+        echo "\$ $*"
+        echo
+        rc=0
+        "$@" || rc=$?
+        echo
+        echo "[exit_status=$rc]"
+    } >> "$outfile" 2>&1
+}
+
+run_shell() {
+    outfile="$1"
+    title="$2"
+    command="$3"
+
+    write_header "$outfile" "$title"
+    {
+        echo "\$ $command"
+        echo
+        rc=0
+        /bin/sh -c "$command" || rc=$?
+        echo
+        echo "[exit_status=$rc]"
+    } >> "$outfile" 2>&1
+}
+
+redact_stream() {
+    sed -E \
+        -e 's#([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee][[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#(set[[:space:]]+auth[[:space:]]+password[[:space:]]+).*$#\1"<REDACTED>"#g' \
+        -e 's#(authname[[:space:]]*[=:]?[[:space:]]*).*$#\1"<REDACTED>"#g' \
+        -e 's#([Pp]rivate[Kk]ey[[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Pp]reshared[Kk]ey[[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Pp][Ss][Kk][[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Tt]oken[[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Aa][Pp][Ii][_-]?[Kk][Ee][Yy][[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#([Ss][Ee][Cc][Rr][Ee][Tt][[:space:]]*[=:][[:space:]]*).*$#\1<REDACTED>#g' \
+        -e 's#(community[[:space:]]+)[^[:space:]]+#\1<REDACTED>#g'
+}
+
+copy_redacted_file() {
+    src="$1"
+    dst="$2"
+
+    [ -f "$src" ] && [ ! -L "$src" ] || return 0
+
+    size="$(stat -f '%z' "$src" 2>/dev/null || echo 0)"
+    case "$size" in
+        ''|*[!0-9]*) size=0 ;;
+    esac
+
+    write_header "$dst" "$src"
+
+    if [ "$size" -gt "$MAX_FILE_SIZE" ]; then
+        {
+            echo "# File omitted because it is larger than ${MAX_FILE_SIZE} bytes."
+            echo "# Original size: $size bytes"
+        } >> "$dst"
+        return 0
+    fi
+
+    redact_stream < "$src" >> "$dst" 2>/dev/null || {
+        echo "# Unable to read file." >> "$dst"
+        return 0
+    }
+    chmod 600 "$dst"
+}
+
+copy_redacted_tree() {
+    srcdir="$1"
+    dstdir="$2"
+
+    [ -d "$srcdir" ] && [ ! -L "$srcdir" ] || return 0
+
+    find "$srcdir" -xdev -type f 2>/dev/null | while IFS= read -r src; do
+        rel="${src#"$srcdir"/}"
+        case "$rel" in
+            *.db|*.sqlite|*.sqlite3|*.iso|*.img|*.gz|*.xz|*.bz2|*.zip|*.tgz|*.txz|*.pem|*.key)
+                continue
+                ;;
+        esac
+        dst="$dstdir/$rel"
+        mkdir -p "$(dirname "$dst")"
+        copy_redacted_file "$src" "$dst"
+    done
+}
+
+collect_matching_scripts() {
+    outdir="$WORKDIR/failover/scripts"
+    mkdir -p "$outdir"
+
+    for root in /usr/local/bin /usr/local/sbin /root/bin /root/scripts /usr/local/etc /etc; do
+        [ -d "$root" ] || continue
+
+        find "$root" -xdev -type f \
+            \( -iname '*failover*' -o \
+               -iname '*watchdog*' -o \
+               -iname '*wan*' -o \
+               -iname '*route*' -o \
+               -iname '*awg*' -o \
+               -iname '*amnezia*' -o \
+               -iname '*split*' -o \
+               -iname '*vpn*' \) \
+            2>/dev/null | while IFS= read -r src; do
+                rel="$(printf '%s' "$src" | sed 's#^/##')"
+                dst="$outdir/$rel"
+                mkdir -p "$(dirname "$dst")"
+                copy_redacted_file "$src" "$dst"
+            done
+    done
+}
+
+log "GateBSD collector ${VERSION}"
+log "Collecting system state from ${HOST}..."
+log "No configuration will be changed."
+
+# Metadata
+cat > "$WORKDIR/meta/README.txt" <<EOF
+GateBSD diagnostic report
+
+Host: $HOST
+Created: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+Collector version: $VERSION
+
+This report was collected read-only.
+Common passwords, private keys, tokens and API keys were redacted automatically.
+
+Before sharing, you may inspect the archive manually:
+  tar -tzf "$ARCHIVE_NAME"
+  tar -xzf "$ARCHIVE_NAME"
+EOF
+
+# System
+run_cmd "$WORKDIR/system/freebsd-version.txt" "FreeBSD version" freebsd-version -ku
+run_cmd "$WORKDIR/system/uname.txt" "Kernel information" uname -a
+run_cmd "$WORKDIR/system/uptime.txt" "Uptime" uptime
+run_cmd "$WORKDIR/system/date.txt" "System time" date
+run_cmd "$WORKDIR/system/kldstat.txt" "Loaded kernel modules" kldstat
+run_cmd "$WORKDIR/system/sysctl-routing.txt" "Routing and PF sysctls" sysctl \
+    net.inet.ip.forwarding \
+    net.inet6.ip6.forwarding \
+    net.pf \
+    net.add_addr_allfibs \
+    net.fibs
+run_shell "$WORKDIR/system/sysctl-selected.txt" "Selected network sysctls" \
+    "sysctl -a 2>/dev/null | grep -E '^(net\\.(inet|inet6|pf)|kern\\.securelevel|security\\.)' | head -n 4000"
+run_cmd "$WORKDIR/system/dmesg.txt" "Kernel messages" dmesg
+run_cmd "$WORKDIR/system/pciconf.txt" "PCI devices" pciconf -lv
+run_cmd "$WORKDIR/system/usbconfig.txt" "USB devices" usbconfig
+run_cmd "$WORKDIR/system/mount.txt" "Mounted filesystems" mount
+run_cmd "$WORKDIR/system/df.txt" "Filesystem usage" df -h
+run_cmd "$WORKDIR/system/zpool-status.txt" "ZFS pool status" zpool status
+run_cmd "$WORKDIR/system/zfs-list.txt" "ZFS datasets" zfs list
+
+# Network runtime
+run_cmd "$WORKDIR/network/ifconfig-a.txt" "Interfaces" ifconfig -a
+run_cmd "$WORKDIR/network/netstat-rn.txt" "IPv4 routing table" netstat -rn -f inet
+run_cmd "$WORKDIR/network/netstat-rn6.txt" "IPv6 routing table" netstat -rn -f inet6
+run_cmd "$WORKDIR/network/default-route.txt" "Default route" route -n get default
+run_cmd "$WORKDIR/network/arp.txt" "ARP table" arp -an
+run_cmd "$WORKDIR/network/ndp.txt" "IPv6 neighbors" ndp -an
+run_cmd "$WORKDIR/network/sockstat.txt" "Listening sockets" sockstat -46l
+run_cmd "$WORKDIR/network/netstat-interfaces.txt" "Interface counters" netstat -ibdn
+run_cmd "$WORKDIR/network/netstat-protocols.txt" "Protocol statistics" netstat -s
+run_shell "$WORKDIR/network/fibs.txt" "Routing tables for all FIBs" \
+    "n=\$(sysctl -n net.fibs 2>/dev/null || echo 1); i=0; while [ \$i -lt \$n ]; do echo '### FIB' \$i; setfib \$i netstat -rn; i=\$((i+1)); done"
+
+# PF
+run_cmd "$WORKDIR/pf/info.txt" "PF status" pfctl -si
+run_cmd "$WORKDIR/pf/rules.txt" "Loaded PF filter rules" pfctl -sr -vv
+run_cmd "$WORKDIR/pf/nat.txt" "Loaded PF NAT rules" pfctl -sn -vv
+run_cmd "$WORKDIR/pf/all.txt" "Full PF state" pfctl -sa
+run_cmd "$WORKDIR/pf/tables.txt" "PF tables" pfctl -s Tables
+run_cmd "$WORKDIR/pf/states.txt" "PF states summary" pfctl -ss
+copy_redacted_file "/etc/pf.conf" "$WORKDIR/config/etc-pf.conf"
+
+# Core configs
+copy_redacted_file "/etc/rc.conf" "$WORKDIR/config/etc-rc.conf"
+copy_redacted_file "/etc/rc.conf.local" "$WORKDIR/config/etc-rc.conf.local"
+copy_redacted_file "/etc/sysctl.conf" "$WORKDIR/config/etc-sysctl.conf"
+copy_redacted_file "/boot/loader.conf" "$WORKDIR/config/boot-loader.conf"
+copy_redacted_file "/boot/loader.conf.local" "$WORKDIR/config/boot-loader.conf.local"
+copy_redacted_file "/etc/resolv.conf" "$WORKDIR/config/etc-resolv.conf"
+copy_redacted_file "/etc/crontab" "$WORKDIR/config/etc-crontab"
+copy_redacted_file "/etc/hosts" "$WORKDIR/config/etc-hosts"
+
+# Services and cron
+run_cmd "$WORKDIR/services/enabled.txt" "Enabled services" service -e
+run_cmd "$WORKDIR/services/all.txt" "All rc.d services" service -l
+run_cmd "$WORKDIR/services/processes.txt" "Processes" ps auxww
+run_cmd "$WORKDIR/services/root-crontab.txt" "Root crontab" crontab -l
+run_shell "$WORKDIR/services/user-crontabs.txt" "All user crontabs" \
+    "for u in \$(cut -d: -f1 /etc/passwd); do c=\$(crontab -u \"\$u\" -l 2>/dev/null) || continue; echo '### USER:' \"\$u\"; printf '%s\n' \"\$c\"; echo; done"
+run_shell "$WORKDIR/services/periodic.txt" "Periodic configuration" \
+    "find /etc/periodic /usr/local/etc/periodic -maxdepth 3 -type f -print 2>/dev/null"
+
+# Packages
+run_cmd "$WORKDIR/packages/pkg-info.txt" "Installed packages" pkg info
+run_cmd "$WORKDIR/packages/pkg-version.txt" "Package versions" pkg version -v
+run_shell "$WORKDIR/packages/repositories.txt" "Package repositories" \
+    "find /etc/pkg /usr/local/etc/pkg -type f -maxdepth 3 -print -exec sed -n '1,200p' {} \\; 2>/dev/null"
+
+# Known configuration trees
+copy_redacted_tree "/usr/local/etc/mpd5" "$WORKDIR/config/usr-local-etc-mpd5"
+copy_redacted_tree "/usr/local/etc/unbound" "$WORKDIR/config/usr-local-etc-unbound"
+copy_redacted_tree "/var/unbound" "$WORKDIR/config/var-unbound"
+copy_redacted_file "/usr/local/etc/dhcpd.conf" "$WORKDIR/config/usr-local-etc-dhcpd.conf"
+copy_redacted_tree "/usr/local/etc/dhcpd" "$WORKDIR/config/usr-local-etc-dhcpd"
+copy_redacted_tree "/usr/local/etc/amnezia" "$WORKDIR/vpn/usr-local-etc-amnezia"
+copy_redacted_tree "/usr/local/etc/awg" "$WORKDIR/vpn/usr-local-etc-awg"
+copy_redacted_tree "/usr/local/etc/wireguard" "$WORKDIR/vpn/usr-local-etc-wireguard"
+copy_redacted_tree "/usr/local/etc/gatebsd" "$WORKDIR/config/usr-local-etc-gatebsd"
+
+# VPN runtime
+if command -v awg >/dev/null 2>&1; then
+    run_cmd "$WORKDIR/vpn/awg-show.txt" "AWG runtime" awg show
+fi
+if command -v wg >/dev/null 2>&1; then
+    run_cmd "$WORKDIR/vpn/wg-show.txt" "WireGuard runtime" wg show
+fi
+run_shell "$WORKDIR/vpn/interfaces.txt" "VPN-like interfaces" \
+    "ifconfig -l | tr ' ' '\n' | grep -E '^(awg|wg|tun|tap|gif|gre|ovpn)' | while read i; do ifconfig \"\$i\"; done"
+
+# PPPoE / MPD runtime
+if command -v mpd5 >/dev/null 2>&1 || pgrep -x mpd5 >/dev/null 2>&1; then
+    run_shell "$WORKDIR/network/mpd-process.txt" "MPD5 process and sockets" \
+        "pgrep -laf mpd5; sockstat -46 | grep -E '(^USER|mpd5)'"
+fi
+
+# Failover and custom automation
+collect_matching_scripts
+run_shell "$WORKDIR/failover/rc-settings.txt" "Relevant rc.conf settings" \
+    "sysrc -a 2>/dev/null | grep -Ei 'wan|fail|mpd|ppp|dhcp|unbound|pf|awg|amnezia|vpn|route|gateway|cron'"
+run_shell "$WORKDIR/failover/routes-and-gateways.txt" "Current gateways and routes" \
+    "route -n get default; echo; netstat -rn; echo; ifconfig -a"
+
+# Logs
+if [ "$INCLUDE_LOGS" -eq 1 ]; then
+    for logfile in \
+        /var/log/messages \
+        /var/log/system.log \
+        /var/log/security \
+        /var/log/ppp.log \
+        /var/log/daemon.log \
+        /var/log/all.log \
+        /var/log/debug.log
+    do
+        if [ -f "$logfile" ] && [ ! -L "$logfile" ]; then
+            name="$(printf '%s' "$logfile" | sed 's#^/##; s#/#-#g')"
+            write_header "$WORKDIR/logs/$name" "$logfile (last $MAX_LOG_LINES lines)"
+            tail -n "$MAX_LOG_LINES" "$logfile" 2>/dev/null | redact_stream >> "$WORKDIR/logs/$name"
+        fi
+    done
+
+    if [ -f /var/log/messages ] && [ ! -L /var/log/messages ]; then
+        run_shell "$WORKDIR/logs/relevant-messages.txt" "Relevant recent log messages" \
+            "grep -Eai 'failover|watchdog|gateway|route|pppoe|mpd|dhcp|unbound|pf:|awg|amnezia|wireguard|ue0|ng0' /var/log/messages 2>/dev/null | tail -n 1500"
+    fi
+fi
+
+# Inventory and safety summary
+run_shell "$WORKDIR/meta/file-inventory.txt" "Collected file inventory" \
+    "find '$WORKDIR' -type f -maxdepth 12 -print | sort"
+
+cat > "$WORKDIR/meta/security-notice.txt" <<'EOF'
+SECURITY NOTICE
+
+The collector redacts common credential formats, including:
+- PPP/PPPoE passwords
+- authname fields
+- private and preshared keys
+- API keys, tokens and secrets
+- SNMP community strings
+
+Automated redaction cannot guarantee detection of every custom secret.
+Inspect the archive before sharing it.
+Do not publish this report publicly because it still contains:
+- internal IP addresses
+- interface names
+- firewall and routing topology
+- installed package information
+- portions of system logs
+EOF
+
+log "Creating archive: $ARCHIVE_PATH"
+tar -czf "$ARCHIVE_TMP" -C "$(dirname "$WORKDIR")" "$(basename "$WORKDIR")"
+
+if ! tar -tzf "$ARCHIVE_TMP" >/dev/null 2>&1; then
+    echo "Archive verification failed: $ARCHIVE_PATH" >&2
+    exit 1
+fi
+
+chmod 600 "$ARCHIVE_TMP"
+[ ! -e "$ARCHIVE_PATH" ] && [ ! -L "$ARCHIVE_PATH" ] || { echo "Refusing existing archive: $ARCHIVE_PATH" >&2; exit 1; }
+mv -f "$ARCHIVE_TMP" "$ARCHIVE_PATH"
+ARCHIVE_TMP=""
+
+echo
+echo "Done."
+echo "Archive: $ARCHIVE_PATH"
+echo "Size: $(du -h "$ARCHIVE_PATH" | awk '{print $1}')"
+echo
+echo "Inspect before sharing:"
+echo "  tar -tzf \"$ARCHIVE_PATH\""
+echo
+echo "Then upload the archive to this chat."
+if [ "$KEEP_DIR" -eq 1 ]; then
+    echo "Unpacked report kept at: $WORKDIR"
+fi

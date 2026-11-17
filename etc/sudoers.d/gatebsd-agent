@@ -1,0 +1,2 @@
+Defaults:gatebsd-agent env_reset, !setenv, !mail_badpass, secure_path="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin", umask=0022, runcwd=/
+gatebsd-agent ALL=(root) NOPASSWD: /usr/local/sbin/gatebsd-agentctl

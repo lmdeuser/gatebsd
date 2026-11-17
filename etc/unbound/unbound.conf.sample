@@ -1,0 +1,67 @@
+server:
+    username: unbound
+    auto-trust-anchor-file: "/state/root.key"
+
+
+    interface: 10.88.0.1
+    port: 53
+
+    access-control: 127.0.0.0/8 allow
+    access-control: 10.88.0.0/24 allow
+    access-control: 0.0.0.0/0 refuse
+
+    do-ip4: yes
+    do-ip6: no
+    do-udp: yes
+    do-tcp: yes
+
+    hide-identity: yes
+    hide-version: yes
+
+    qname-minimisation: yes
+
+    # Firefox resolves this name before deciding whether to switch itself to
+    # DNS-over-HTTPS. While it answers, the browser stops asking us and the
+    # blocklist, the RU routes and every other DNS policy here are bypassed.
+    # NXDOMAIN is the documented signal to leave the resolver alone.
+    local-zone: "use-application-dns.net" always_nxdomain
+
+    prefetch: yes
+    prefetch-key: yes
+
+    serve-expired: yes
+    serve-expired-ttl: 86400
+    serve-expired-reply-ttl: 30
+
+    cache-min-ttl: 300
+    cache-max-ttl: 86400
+    cache-max-negative-ttl: 300
+
+    rrset-cache-size: 128m
+    msg-cache-size: 64m
+
+    outgoing-range: 512
+    num-threads: 2
+
+    edns-buffer-size: 1232
+
+    harden-glue: yes
+    harden-dnssec-stripped: yes
+    harden-referral-path: yes
+
+    unwanted-reply-threshold: 10000000
+
+    verbosity: 1
+
+    # Without this the resolver answers only how many queries it saw. Nobody
+    # could say what share was refused, what the cache was worth, or how long
+    # answers took -- so "is the filtering working" was a matter of opinion.
+    # It counts; it does not log what anybody asked for.
+    extended-statistics: yes
+
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1
+    forward-addr: 1.0.0.1
+    forward-addr: 9.9.9.9
+    forward-addr: 149.112.112.112

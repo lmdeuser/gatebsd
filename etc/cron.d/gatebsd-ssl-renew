@@ -1,0 +1,2 @@
+# Renew early enough to recover from transient ACME/DuckDNS failures.
+17 2 * * * root /usr/local/sbin/gatebsd-renew-ssl

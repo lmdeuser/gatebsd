@@ -1,0 +1,482 @@
+#!/bin/sh
+# Point a device at the GateBSD package repository.
+#
+# Two files decide whether a device takes its packages from this project or
+# from upstream quarterly: the repository config and the stand's public key.
+# Until now they existed only as text typed by hand into the production router
+# on 30 July -- not in this tree, not in any package, not published anywhere.
+# A device rebuilt from an image would have come up carrying the same version
+# number and a different set of packages, which is exactly the promise the dual
+# delivery path makes ("image and package land on identical state").
+#
+# So this runs at two moments:
+#
+#   - once on a bare device, from a source checkout or the release source
+#     archive, before `pkg install gatebsd` -- there is no package yet, and the
+#     package cannot be fetched until this has run;
+#   - on every upgrade, from the package's post-install, so a device that
+#     drifted converges back instead of drifting quietly.
+#
+# The public key is a trust anchor and has to arrive out of band: fetching it
+# over plain HTTP from the very host it is meant to authenticate proves
+# nothing. It travels inside this tree and inside the source archive, and its
+# SHA256 is printed on every run so it can be compared against a value carried
+# separately. That digest is recorded in docs/PKG_REPOSITORY.md.
+#
+# The previous content is moved aside, never dropped: a repository config that
+# someone edited on purpose is evidence of how the device came to differ.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+export PATH
+
+PREFIX=${GATEBSD_REPO_PREFIX:-/usr/local}
+SOURCE_DIR=${GATEBSD_REPO_SOURCE:-}
+BACKUP_ROOT=${GATEBSD_REPO_BACKUP_ROOT:-/var/backups/gatebsd-pkg}
+# Resolved against PREFIX after the arguments are parsed, because --prefix may
+# still move PREFIX. Computing it here would silently ignore --prefix and send
+# a redirected run looking at the real device's sources file.
+SOURCES_FILE=${GATEBSD_REPO_SOURCES:-}
+DEFAULT_SOURCE=http://mirror.example.lan
+CHECK=0
+
+usage() {
+    cat <<USAGE
+Usage: gatebsd-repo-bootstrap [--check] [--source-dir DIR]
+                              [--sources-file FILE] [--prefix DIR]
+
+  --check        report drift against the canonical files and change nothing
+  --source-dir   where the canonical files live (default: autodetected)
+  --sources-file which package sources the panel selected
+                 (default: PREFIX/etc/gatebsd/repo-sources.conf)
+  --prefix       install below DIR instead of /usr/local
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) CHECK=1 ;;
+        --source-dir)
+            [ "$#" -ge 2 ] || { echo "--source-dir needs a directory" >&2; exit 2; }
+            SOURCE_DIR=$2
+            shift
+            ;;
+        --sources-file)
+            [ "$#" -ge 2 ] || { echo "--sources-file needs a file" >&2; exit 2; }
+            SOURCES_FILE=$2
+            shift
+            ;;
+        --prefix)
+            [ "$#" -ge 2 ] || { echo "--prefix needs a directory" >&2; exit 2; }
+            PREFIX=$2
+            shift
+            ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+case "$PREFIX" in
+    /*) ;;
+    *) echo "--prefix must be absolute: $PREFIX" >&2; exit 2 ;;
+esac
+
+# Writing into /usr/local/etc/pkg is root's business. The regression harness
+# has to *run* this script rather than read it -- a bootstrap that is never
+# executed is how the delivery gap got here in the first place -- so a
+# redirected prefix is honoured unprivileged, and only a redirected one.
+if [ "$(id -u)" -ne 0 ]; then
+    [ "$PREFIX" != /usr/local ] || { echo "Run as root" >&2; exit 1; }
+fi
+
+TARGET_DIR=$PREFIX/etc/pkg
+[ -n "$SOURCES_FILE" ] || SOURCES_FILE=$PREFIX/etc/gatebsd/repo-sources.conf
+
+resolved() {
+    realpath "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+if [ -z "$SOURCE_DIR" ]; then
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+    _target_resolved=$(resolved "$TARGET_DIR")
+    # A checkout first: someone running this out of the tree means the tree.
+    # $SCRIPT_DIR/../etc/pkg is the checkout when the script sits in sbin/ and
+    # is /usr/local/etc/pkg -- the destination itself -- once it is installed.
+    # Comparing the destination against itself is the same nothing as a test
+    # that reads a script instead of running it, so that candidate is dropped.
+    for _candidate in "$SCRIPT_DIR/../etc/pkg" "$PREFIX/share/gatebsd/etc/pkg"; do
+        [ -f "$_candidate/repos/gatebsd.conf" ] || continue
+        [ -f "$_candidate/keys/gatebsd-stand.pub" ] || continue
+        [ "$(resolved "$_candidate")" != "$_target_resolved" ] || continue
+        SOURCE_DIR=$_candidate
+        break
+    done
+fi
+
+[ -n "$SOURCE_DIR" ] || {
+    echo "Canonical repository files not found; pass --source-dir" >&2
+    exit 2
+}
+for _relative in repos/gatebsd.conf keys/gatebsd-stand.pub; do
+    [ -f "$SOURCE_DIR/$_relative" ] || {
+        echo "Missing canonical file: $SOURCE_DIR/$_relative" >&2
+        exit 2
+    }
+done
+[ "$(resolved "$SOURCE_DIR")" != "$(resolved "$TARGET_DIR")" ] || {
+    echo "Source and destination are the same directory: $SOURCE_DIR" >&2
+    exit 2
+}
+
+# install -d re-applies ownership to a directory that already exists, and both
+# shared runtime directories in this product have been broken that way. What is
+# already there is validated, never re-owned.
+ensure_dir() {
+    _dir=$1
+    if [ -e "$_dir" ] || [ -L "$_dir" ]; then
+        [ -d "$_dir" ] && [ ! -L "$_dir" ] || {
+            echo "Unsafe directory: $_dir" >&2
+            exit 1
+        }
+        return 0
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        install -d -o root -g wheel -m 0755 "$_dir"
+    else
+        install -d -m 0755 "$_dir"
+    fi
+}
+
+install_file() {
+    _source=$1
+    _target=$2
+    _mode=$3
+    if [ "$(id -u)" -eq 0 ]; then
+        install -o root -g wheel -m "$_mode" "$_source" "$_target"
+    else
+        install -m "$_mode" "$_source" "$_target"
+    fi
+}
+
+# FreeBSD stat wants -f, GNU stat wants -c, and GNU stat -f is a *different*
+# command that reports the filesystem and succeeds -- so the answer is
+# validated as an octal mode rather than trusted because the call exited 0.
+file_mode() {
+    _reported=$(stat -f '%Lp' "$1" 2>/dev/null || true)
+    case "$_reported" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s' "$_reported"; return 0 ;;
+    esac
+    _reported=$(stat -c '%a' "$1" 2>/dev/null || true)
+    case "$_reported" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s' "$_reported"; return 0 ;;
+    esac
+    echo "Cannot read the mode of $1" >&2
+    return 1
+}
+
+# Which package source the panel selected.
+#
+# The file is the panel's, and this script is its only reader: two writers on
+# one file is the defect tests/test_one_writer_per_managed_file.py exists to
+# prevent, so the panel writes the source list and never gatebsd.conf itself.
+#
+# A missing file is not an error. A bare device has no panel yet, and the whole
+# point of this script is that it runs before there is anything installed.
+read_active_source() {
+    if [ ! -e "$SOURCES_FILE" ] && [ ! -L "$SOURCES_FILE" ]; then
+        printf '%s\n' "$DEFAULT_SOURCE"
+        return 0
+    fi
+    [ -f "$SOURCES_FILE" ] && [ ! -L "$SOURCES_FILE" ] || {
+        echo "Unsafe package sources file: $SOURCES_FILE" >&2
+        return 1
+    }
+
+    _active_url=
+    _active_count=0
+    _line_number=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line_number=$((_line_number + 1))
+        _line=${_line%"${_line##*[![:space:]]}"}
+        _line=${_line#"${_line%%[![:space:]]*}"}
+        case "$_line" in
+            ''|'#'*) continue ;;
+            *'|'*)
+                _state=${_line%%|*}
+                _url=${_line#*|}
+                # Trimmed around the delimiter too, not just at the ends of the
+                # line. The panel always writes canonical lines, so this only
+                # matters for a file someone edited by hand -- which is exactly
+                # the case where the two readers of this format must not
+                # disagree. They did: the panel accepted `active | url` and this
+                # reader rejected it, so a hand edit the panel showed as fine
+                # would have failed at the next upgrade.
+                _state=${_state%"${_state##*[![:space:]]}"}
+                _state=${_state#"${_state%%[![:space:]]*}"}
+                _url=${_url%"${_url##*[![:space:]]}"}
+                _url=${_url#"${_url%%[![:space:]]*}"}
+                ;;
+            *)
+                echo "$SOURCES_FILE:$_line_number: expected <state>|<url>" >&2
+                return 1
+                ;;
+        esac
+        case "$_url" in
+            *'|'*)
+                echo "$SOURCES_FILE:$_line_number: extra delimiter" >&2
+                return 1
+                ;;
+        esac
+
+        # This URL is interpolated into a pkg configuration file, so the
+        # characters that could end the quoted string and start something else
+        # are rejected here rather than escaped later.
+        case "$_url" in
+            http://*) _rest=${_url#http://} ;;
+            https://*) _rest=${_url#https://} ;;
+            *)
+                echo "$SOURCES_FILE:$_line_number: URL must start with http:// or https://" >&2
+                return 1
+                ;;
+        esac
+        case "$_rest" in
+            *:*:*|*/*)
+                echo "$SOURCES_FILE:$_line_number: URL must be a bare host, no path: $_url" >&2
+                return 1
+                ;;
+            *:*)
+                _host=${_rest%:*}
+                _port=${_rest#*:}
+                case "$_port" in
+                    ''|*[!0-9]*)
+                        echo "$SOURCES_FILE:$_line_number: invalid port: $_url" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            *) _host=$_rest ;;
+        esac
+        case "$_host" in
+            ''|*[!a-zA-Z0-9.-]*)
+                echo "$SOURCES_FILE:$_line_number: invalid host: $_url" >&2
+                return 1
+                ;;
+        esac
+
+        case "$_state" in
+            active)
+                _active_count=$((_active_count + 1))
+                _active_url=$_url
+                ;;
+            known) ;;
+            *)
+                echo "$SOURCES_FILE:$_line_number: unknown state '$_state'" >&2
+                return 1
+                ;;
+        esac
+    done < "$SOURCES_FILE"
+
+    [ "$_active_count" -ne 0 ] || {
+        echo "$SOURCES_FILE: no active package source" >&2
+        return 1
+    }
+    [ "$_active_count" -eq 1 ] || {
+        echo "$SOURCES_FILE: $_active_count active sources, expected exactly one" >&2
+        return 1
+    }
+    printf '%s\n' "$_active_url"
+}
+
+# The repository configuration, derived from the one active source.
+#
+# Choosing a mirror is not choosing a trust anchor. The pubkey path is a
+# literal here and is never read from the sources file, so a panel defect or a
+# tampered source list can change WHERE packages come from and never WHOSE
+# signature this device accepts. It stays /usr/local even under --prefix,
+# because that is where pkg on a real device reads it from; a redirected run
+# is a rehearsal, not a device.
+render_repo_conf() {
+    _base=$1
+    cat <<RENDERED
+# The appliance takes its packages from the GateBSD stand, not from upstream.
+#
+# Closed development loop: every package on a device must be one this project
+# built and signed, so that the image path and the package-upgrade path land on
+# identical state for a given version. Upstream quarterly is disabled rather
+# than left as a fallback -- a fallback would silently reintroduce packages
+# nobody here built.
+FreeBSD-ports: { enabled: no }
+FreeBSD-ports-kmods: { enabled: no }
+
+# Signed GateBSD releases. \`current\` follows the newest published version.
+gatebsd-releases: {
+    url: "$_base/gatebsd/releases/current",
+    mirror_type: "none",
+    signature_type: "pubkey",
+    pubkey: "/usr/local/etc/pkg/keys/gatebsd-stand.pub",
+    enabled: yes
+}
+
+# Dependencies, built by poudriere on the stand. poudriere publishes into
+# .latest; the stand's nginx resolves that dot server-side so this URL has none.
+gatebsd-ports: {
+    url: "$_base/gatebsd/packages/freebsd_151_amd64-default/latest",
+    mirror_type: "none",
+    signature_type: "pubkey",
+    pubkey: "/usr/local/etc/pkg/keys/gatebsd-stand.pub",
+    enabled: yes
+}
+RENDERED
+}
+
+# converge(), but for content held in a variable instead of a file on disk.
+#
+# --check writes nothing at all: the comparison goes through a pipe, so a
+# check run on a read-only or root-owned tree reports drift instead of failing
+# to create a scratch file next to the thing it is inspecting.
+converge_rendered() {
+    _relative=$1
+    _mode=$2
+    _content=$3
+    _target=$TARGET_DIR/$_relative
+
+    if [ -e "$_target" ] || [ -L "$_target" ]; then
+        [ -f "$_target" ] && [ ! -L "$_target" ] || {
+            echo "Unsafe destination: $_target" >&2
+            exit 1
+        }
+        if printf '%s\n' "$_content" | cmp -s - "$_target"; then
+            _want=$(printf '%o' "$((_mode))")
+            _have=$(file_mode "$_target")
+            if [ "$_have" = "$_want" ]; then
+                printf 'ok      %s\n' "$_target"
+                return 0
+            fi
+            DRIFT=1
+            if [ "$CHECK" -eq 1 ]; then
+                printf 'DRIFT   %s (mode %s, expected %s)\n' "$_target" "$_have" "$_want"
+                return 0
+            fi
+            chmod "$_mode" "$_target"
+            CHANGED=1
+            printf 'chmod   %s (%s -> %s)\n' "$_target" "$_have" "$_want"
+            return 0
+        fi
+        _state=differs
+    else
+        _state=missing
+    fi
+
+    DRIFT=1
+    if [ "$CHECK" -eq 1 ]; then
+        printf 'DRIFT   %s (%s)\n' "$_target" "$_state"
+        return 0
+    fi
+
+    ensure_dir "$(dirname "$_target")"
+    if [ "$_state" = differs ]; then
+        _backup=$BACKUP_ROOT/$STAMP/$_relative
+        ensure_dir "$(dirname "$_backup")"
+        cp -p "$_target" "$_backup"
+        printf 'kept    %s\n' "$_backup"
+    fi
+    _scratch=$(mktemp "$TARGET_DIR/.gatebsd-repo.XXXXXX")
+    printf '%s\n' "$_content" > "$_scratch" || {
+        rm -f "$_scratch"
+        echo "Cannot stage $_target" >&2
+        exit 1
+    }
+    install_file "$_scratch" "$_target" "$_mode"
+    rm -f "$_scratch"
+    CHANGED=1
+    printf 'wrote   %s (%s)\n' "$_target" "$_state"
+}
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DRIFT=0
+CHANGED=0
+
+converge() {
+    _relative=$1
+    _mode=$2
+    _source=$SOURCE_DIR/$_relative
+    _target=$TARGET_DIR/$_relative
+
+    if [ -e "$_target" ] || [ -L "$_target" ]; then
+        [ -f "$_target" ] && [ ! -L "$_target" ] || {
+            echo "Unsafe destination: $_target" >&2
+            exit 1
+        }
+        if cmp -s "$_source" "$_target"; then
+            # Right content, wrong permissions is still drift, and on the trust
+            # anchor it is the drift that matters: a writable pubkey decides
+            # what this device will accept as a signed package. Found on the
+            # rehearsal rig, where the key was byte-identical and 0644.
+            _want=$(printf '%o' "$((_mode))")
+            _have=$(file_mode "$_target")
+            if [ "$_have" = "$_want" ]; then
+                printf 'ok      %s\n' "$_target"
+                return 0
+            fi
+            DRIFT=1
+            if [ "$CHECK" -eq 1 ]; then
+                printf 'DRIFT   %s (mode %s, expected %s)\n' "$_target" "$_have" "$_want"
+                return 0
+            fi
+            chmod "$_mode" "$_target"
+            CHANGED=1
+            printf 'chmod   %s (%s -> %s)\n' "$_target" "$_have" "$_want"
+            return 0
+        fi
+        _state=differs
+    else
+        _state=missing
+    fi
+
+    DRIFT=1
+    if [ "$CHECK" -eq 1 ]; then
+        printf 'DRIFT   %s (%s)\n' "$_target" "$_state"
+        return 0
+    fi
+
+    ensure_dir "$(dirname "$_target")"
+    if [ "$_state" = differs ]; then
+        _backup=$BACKUP_ROOT/$STAMP/$_relative
+        ensure_dir "$(dirname "$_backup")"
+        cp -p "$_target" "$_backup"
+        printf 'kept    %s\n' "$_backup"
+    fi
+    install_file "$_source" "$_target" "$_mode"
+    CHANGED=1
+    printf 'wrote   %s (%s)\n' "$_target" "$_state"
+}
+
+ensure_dir "$TARGET_DIR"
+# The key goes down before the config that names it: a config pointing at a
+# pubkey that is not there yet makes pkg fail on every repository operation,
+# and on a bare device that is the operation being bootstrapped.
+converge keys/gatebsd-stand.pub 0444
+ACTIVE_SOURCE=$(read_active_source) || {
+    echo "Refusing to render a repository config from an unusable source list" >&2
+    exit 2
+}
+converge_rendered repos/gatebsd.conf 0644 "$(render_repo_conf "$ACTIVE_SOURCE")"
+printf 'source  %s\n' "$ACTIVE_SOURCE"
+
+printf 'key     sha256 %s\n' "$(
+    sha256 -q "$SOURCE_DIR/keys/gatebsd-stand.pub" 2>/dev/null ||
+    sha256sum "$SOURCE_DIR/keys/gatebsd-stand.pub" | awk '{print $1}'
+)"
+
+if [ "$CHECK" -eq 1 ]; then
+    [ "$DRIFT" -eq 0 ] || {
+        echo "Package repository configuration has drifted from the release" >&2
+        exit 1
+    }
+    echo "Package repository configuration matches the release"
+    exit 0
+fi
+
+[ "$CHANGED" -eq 0 ] || echo "Package repository configuration installed; run 'pkg update -f' next"
+exit 0

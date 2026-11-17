@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+BACKEND=${GATEBSD_BACKEND:-/usr/local/share/gatebsd/webui/backend}
+[ -x "$PYTHON_LAUNCHER" ] && [ ! -L "$PYTHON_LAUNCHER" ] || { echo "gatebsd-passwd: Python launcher unavailable" >&2; exit 1; }
+exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 PYTHONPATH="$BACKEND" \
+    "$PYTHON_LAUNCHER" -m gatebsd_ui.passwd_cli "$@"

@@ -1,0 +1,228 @@
+#!/bin/sh
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+MODE=existing
+DRYRUN=0
+ENABLE=0
+START=0
+BACKUP_ROOT=${GATEBSD_INSTALL_BACKUP_ROOT:-/var/backups/gatebsd}
+LOCK_FILE=${GATEBSD_INSTALL_LOCK:-/var/run/gatebsd/install.lock}
+
+
+safe_private_root() {
+    _root=$1
+    case "$_root" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$_root" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/libexec|/media|/mnt|/proc|/rescue|/root|/sbin|/sys|/tmp|/usr|/usr/local|/var|/var/backups)
+            return 1
+            ;;
+        *[!A-Za-z0-9_./-]*|*//*|*/../*|*/..|*/./*|*/.)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Create the shared runtime directory if it is missing, and otherwise leave its
+# ownership alone.
+#
+# /var/run/gatebsd holds the agent's unix socket, and the web UI runs as the
+# unprivileged service account, which needs the group's traverse bit to reach
+# it. `install -d -o root -g wheel` re-applies owner, group and mode to a
+# directory that already exists. The `install -d ... -g gatebsd /var/run/gatebsd`
+# further down deliberately establishes the service group on a fresh install;
+# this call runs before it, on every re-run of the installer against a live
+# device, and would undo it. Validate what is there; never re-own it. Full
+# account in sbin/ru-bypass-update.sh.
+ensure_runtime_dir() {
+    _dir=$1
+    if [ -e "$_dir" ] || [ -L "$_dir" ]; then
+        [ -d "$_dir" ] && [ ! -L "$_dir" ] || { echo "unsafe runtime directory: $_dir" >&2; exit 1; }
+        _dir_uid=$(stat -f '%u' "$_dir" 2>/dev/null || printf '%s' -1)
+        _dir_mode=$(stat -f '%Lp' "$_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_dir_uid" = 0 ] || { echo "runtime directory must be root-owned: $_dir" >&2; exit 1; }
+        case "$_dir_mode" in
+            *[2367][0-7]|*[0-7][2367]) echo "runtime directory must not be group/world writable: $_dir" >&2; exit 1 ;;
+        esac
+    else
+        install -d -o root -g "${GATEBSD_SERVICE_GROUP:-gatebsd}" -m 0750 "$_dir"
+    fi
+}
+
+usage() {
+    cat <<USAGE
+Usage: gatebsd-install [--existing] [--dry-run] [--enable] [--start]
+Default is --existing: preserve all current networking and import state only.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --existing) MODE=existing ;;
+        --fresh)
+            echo "Fresh network provisioning is not automated; configure FreeBSD networking first and use --existing." >&2
+            exit 2
+            ;;
+        --dry-run) DRYRUN=1 ;;
+        --enable) ENABLE=1 ;;
+        --start) START=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[ "$(id -u)" -eq 0 ] || { echo "Run as root" >&2; exit 1; }
+
+if [ "${GATEBSD_INSTALL_LOCK_HELD:-0}" != 1 ]; then
+    command -v lockf >/dev/null 2>&1 || { echo "lockf is required" >&2; exit 1; }
+    ensure_runtime_dir "$(dirname "$LOCK_FILE")"
+    set -- "$0" --existing
+    [ "$DRYRUN" -eq 0 ] || set -- "$@" --dry-run
+    [ "$ENABLE" -eq 0 ] || set -- "$@" --enable
+    [ "$START" -eq 0 ] || set -- "$@" --start
+    exec env -i PATH="$PATH" HOME=/root LANG=C.UTF-8 \
+        GATEBSD_INSTALL_LOCK_HELD=1 \
+        GATEBSD_PATH="$PATH" \
+        GATEBSD_INSTALL_BACKUP_ROOT="$BACKUP_ROOT" \
+        GATEBSD_INSTALL_LOCK="$LOCK_FILE" \
+        lockf -t 0 "$LOCK_FILE" "$@"
+fi
+
+BASE="$(CDPATH= cd -- "$(dirname "$0")/.." 2>/dev/null && pwd -P || pwd -P)"
+[ -f "$BASE/Makefile" ] || BASE="$(pwd -P)"
+SOURCE_INSTALL=0
+[ -f "$BASE/Makefile" ] && SOURCE_INSTALL=1
+[ "$SOURCE_INSTALL" -eq 1 ] || [ -f /usr/local/share/gatebsd/VERSION ] || {
+    echo "GateBSD package or source tree not found" >&2
+    exit 1
+}
+SCAN=/usr/local/sbin/gatebsd-scan
+[ "$SOURCE_INSTALL" -eq 0 ] || SCAN="$BASE/sbin/gatebsd-scan"
+
+run() {
+    printf '+ '
+    printf '%s ' "$@"
+    printf '\n'
+    [ "$DRYRUN" -eq 1 ] || "$@"
+}
+
+safe_regular() {
+    [ -f "$1" ] && [ ! -L "$1" ]
+}
+
+safe_private_root "$BACKUP_ROOT" || {
+    echo "Unsafe backup root: $BACKUP_ROOT" >&2
+    exit 1
+}
+if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
+    [ -d "$BACKUP_ROOT" ] && [ ! -L "$BACKUP_ROOT" ] || {
+        echo "Unsafe backup root: $BACKUP_ROOT" >&2
+        exit 1
+    }
+else
+    run install -d -o root -g wheel -m 0700 "$BACKUP_ROOT"
+fi
+[ "$DRYRUN" -eq 1 ] || chmod 0700 "$BACKUP_ROOT"
+
+STAMP="$(date '+%Y%m%d-%H%M%S')-$$"
+BACKUP="$BACKUP_ROOT/$STAMP"
+run install -d -o root -g wheel -m 0700 "$BACKUP"
+
+echo "GateBSD installer: mode=$MODE"
+echo "Network policy: PRESERVE. PF/DHCP/DNS/PPPoE/AWG/routes will not be overwritten."
+
+for file in /etc/rc.conf /etc/pf.conf /etc/sysctl.conf /boot/loader.conf \
+    /usr/local/etc/gatebsd/gatebsd.conf /usr/local/etc/gatebsd/failover.conf /usr/local/etc/gatebsd/split-dns.conf \
+    /usr/local/etc/amnezia/gateway.conf /usr/local/etc/mpd5/mpd.conf \
+    /usr/local/etc/dhcpd.conf /usr/local/etc/unbound/unbound.conf /usr/local/etc/unbound/split-dns.conf /var/unbound/unbound.conf \
+    /usr/local/etc/nut/nut.conf /usr/local/etc/nut/ups.conf /usr/local/etc/nut/upsd.conf \
+    /usr/local/etc/nut/upsd.users /usr/local/etc/nut/upsmon.conf
+do
+    if safe_regular "$file"; then
+        target="$(printf '%s' "$file" | sed 's#^/##;s#/#_#g')"
+        run cp -p "$file" "$BACKUP/$target"
+    elif [ -e "$file" ] || [ -L "$file" ]; then
+        echo "Refusing unsafe backup source: $file" >&2
+        exit 1
+    fi
+done
+
+if [ "$SOURCE_INSTALL" -eq 0 ] && [ -x "$SCAN" ] && [ ! -L "$SCAN" ]; then
+    run "$SCAN" "$BACKUP/discovery.json"
+fi
+
+if [ "$DRYRUN" -eq 1 ]; then
+    echo "Would install UI, root agent, scanner, collector and failover daemon without changing live network configuration."
+    exit 0
+fi
+
+[ "$SOURCE_INSTALL" -eq 0 ] || make -C "$BASE" install-safe
+install -d -o gatebsd -g gatebsd -m 0750 /var/db/gatebsd
+install -d -o root -g wheel -m 0750 /var/db/gatebsd-system
+install -d -o root -g gatebsd -m 0750 /var/run/gatebsd
+install -d -o root -g wheel -m 0750 /usr/local/etc/gatebsd
+
+if [ ! -e /usr/local/etc/gatebsd/failover.conf ] && [ ! -L /usr/local/etc/gatebsd/failover.conf ]; then
+    sample="$BASE/etc/gatebsd/failover.conf.sample"
+    [ "$SOURCE_INSTALL" -eq 1 ] || sample=/usr/local/share/gatebsd/etc/gatebsd/failover.conf.sample
+    [ -f "$sample" ] && [ ! -L "$sample" ] || { echo "Unsafe failover sample: $sample" >&2; exit 1; }
+    install -o root -g wheel -m 0600 "$sample" /usr/local/etc/gatebsd/failover.conf
+elif [ -L /usr/local/etc/gatebsd/failover.conf ] || [ ! -f /usr/local/etc/gatebsd/failover.conf ]; then
+    echo "Unsafe failover configuration" >&2
+    exit 1
+fi
+if [ ! -e /usr/local/etc/gatebsd/split-dns.conf ] && [ ! -L /usr/local/etc/gatebsd/split-dns.conf ]; then
+    sample="$BASE/etc/gatebsd/split-dns.conf.sample"
+    [ "$SOURCE_INSTALL" -eq 1 ] || sample=/usr/local/share/gatebsd/etc/gatebsd/split-dns.conf.sample
+    [ -f "$sample" ] && [ ! -L "$sample" ] || { echo "Unsafe split-dns sample: $sample" >&2; exit 1; }
+    install -o root -g wheel -m 0600 "$sample" /usr/local/etc/gatebsd/split-dns.conf
+elif [ -L /usr/local/etc/gatebsd/split-dns.conf ] || [ ! -f /usr/local/etc/gatebsd/split-dns.conf ]; then
+    echo "Unsafe split-dns configuration" >&2
+    exit 1
+fi
+
+# Migrate legacy root-owned files before any rc.d script calls safe_source.
+/usr/local/sbin/gatebsd-config-migrate
+[ ! -x /usr/local/sbin/gatebsd-ups-bootstrap ] || /usr/local/sbin/gatebsd-ups-bootstrap
+
+[ -d /var/db/gatebsd ] && [ ! -L /var/db/gatebsd ] || { echo "Unsafe GateBSD state directory: /var/db/gatebsd" >&2; exit 1; }
+[ ! -L /var/db/gatebsd/install-mode ] || { echo "Refusing symlinked install-mode" >&2; exit 1; }
+_mode_tmp=$(mktemp /var/db/gatebsd/.install-mode.XXXXXX) || exit 1
+printf '%s\n' "$MODE" > "$_mode_tmp"
+chmod 0640 "$_mode_tmp"
+chown gatebsd:gatebsd "$_mode_tmp"
+mv -f "$_mode_tmp" /var/db/gatebsd/install-mode
+/usr/local/sbin/gatebsd-scan /var/db/gatebsd/discovery.json
+
+if [ "$ENABLE" -eq 1 ]; then
+    sysrc gatebsd_enable=YES >/dev/null
+    sysrc gatebsd_failover_enable=YES >/dev/null
+    sysrc nginx_enable=YES >/dev/null
+    # The two rc scripts this package ships for the data path were never
+    # enabled here. The working router has them set, but by hand -- so a device
+    # rebuilt from the image comes up with no VPN and no RU routes, and looks
+    # like a unit that simply lost its tunnel. Same family as the pkg
+    # repository config that also exists only on the live machine.
+    sysrc gatewayctl_apply_enable=YES >/dev/null
+    sysrc ru_bypass_enable=YES >/dev/null
+fi
+if [ "$START" -eq 1 ]; then
+    nginx -t
+    service nginx restart || service nginx start
+    service gatebsd restart || service gatebsd start
+    service gatebsd_failover restart || service gatebsd_failover start
+    service gatebsd_reverse_ssh restart || service gatebsd_reverse_ssh start
+    service gatebsd status
+    service gatebsd_failover status
+    service gatebsd_reverse_ssh status
+fi
+
+mode_value="$(awk -F= '$1 ~ /^[[:space:]]*FAILOVER_MODE[[:space:]]*$/ {v=$2; gsub(/["[:space:]]/, "", v); print v; exit}' /usr/local/etc/gatebsd/failover.conf)"
+echo "Installed safely. Existing gateway configuration was preserved."
+echo "Install mode: $MODE. Failover mode: ${mode_value:-unknown}"
+echo "Backup: $BACKUP"

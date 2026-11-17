@@ -1,0 +1,207 @@
+# Host-side components of the delivery stand, and where they belong.
+#
+# This file is the single source both install-ci-host.sh and
+# verify-deployment.sh read, so an installer that puts a file somewhere and a
+# verifier that looks for it elsewhere cannot drift apart.
+#
+# Columns: repository path, deployed path, mode, owner, group.
+#
+# Deployed copies do not update themselves from git. Before this manifest
+# existed they were scp'd by hand, which is how /usr/local/sbin came to hold
+# mirror-health-check next to mirror-health-check-v2, four dated backups of it,
+# and a pipeline that ran whichever one a cron file happened to name.
+
+ci/host/gatebsd-ci-build                     /usr/local/libexec/gatebsd-ci-build              0750 root wheel
+ci/host/gatebsd-ci-dispatch                  /usr/local/libexec/gatebsd-ci-dispatch           0550 root operator
+ci/host/prepare-gatebsd-build-jail.sh        /usr/local/libexec/prepare-gatebsd-build-jail.sh 0750 root wheel
+infra/freebsd-ci/verify-deployment.sh        /usr/local/libexec/verify-deployment.sh          0750 root wheel
+infra/freebsd-ci/leftovers.sh                /usr/local/libexec/leftovers.sh                  0644 root wheel
+infra/freebsd-ci/retire-leftovers.sh         /usr/local/libexec/retire-leftovers.sh           0750 root wheel
+infra/freebsd-ci/deployment.scan             /usr/local/libexec/deployment.scan               0644 root wheel
+
+# The key the appliance verifies this stand's package repository with. The build
+# jail now verifies it with the same key, so the key had to stop being a file
+# that only existed in the repository and in whatever copy a machine happened to
+# hold.
+etc/pkg/keys/gatebsd-stand.pub               /usr/local/etc/pkg/keys/gatebsd-stand.pub        0644 root wheel
+
+infra/freebsd-ci/mirror-sync-freebsd-15-amd64.sh /usr/local/sbin/mirror-sync-freebsd-15-amd64 0750 root wheel
+infra/freebsd-ci/mirror-health-check.sh      /usr/local/sbin/mirror-health-check              0750 root wheel
+infra/freebsd-ci/mirror-publish-http.sh      /usr/local/sbin/mirror-publish-http              0750 root wheel
+infra/freebsd-ci/mirror-publish-release.sh   /usr/local/sbin/mirror-publish-release           0750 root wheel
+infra/freebsd-ci/mirror-status-update.sh     /usr/local/sbin/mirror-status-update             0750 root wheel
+# 0755, unlike its neighbours, and deliberately: the CI dispatcher execs it as
+# ci_deployer, which is in group operator, not wheel. It only reads the
+# published status files, so there is nothing here to withhold.
+infra/freebsd-ci/mirror-status-report.sh     /usr/local/sbin/mirror-status-report             0755 root wheel
+infra/freebsd-ci/ci-dashboard-update.sh      /usr/local/sbin/ci-dashboard-update              0755 root wheel
+infra/freebsd-ci/renew-stand-tls.sh          /usr/local/sbin/renew-stand-tls                 0750 root wheel
+
+# The crontab that schedules all of the above. It belongs here for the same
+# reason the scripts do, and for one more: cron(8) reads every file in a cron.d
+# directory whatever it is named, so an older generation left beside this one
+# is a second live schedule, not a backup. Two such copies were found here --
+# one of them ran an unmanaged mirror-health-check-v2 that wrote the working
+# checker's readiness flag. Listing the file makes both its content and its
+# leftovers subject to verify-deployment.sh and retire-leftovers.sh.
+infra/freebsd-ci/freebsd-mirror.cron         /usr/local/etc/cron.d/freebsd-local-repo        0644 root wheel
+
+# The appliance's package set, and the script that rebuilds the local
+# repository from it. Both were heredocs inside
+# ci/host/configure_freebsd_mirror.sh, which is not part of this mechanism and
+# never was: it is the one-shot poudriere bring-up.
+#
+# That made the crontab above a file with two writers. The manifest won the
+# race -- the deployed schedule is this repository's five entries -- but only
+# because nobody re-ran the script. A re-run would have replaced the whole
+# schedule with the single 04:15 line the heredoc carried, dropping the FreeBSD
+# mirror sync, the health check, the status update and the TLS renewal, and
+# verify-deployment.sh would have said so only afterwards.
+#
+# The pkglist lost the same race the other way. Its live copy had been edited
+# by hand to lang/python312, databases/py-sqlite3@py312 and the two amnezia
+# ports the router's VPN runs on; the heredoc still said lang/python3 and knew
+# nothing about amnezia. Nothing was watching, because the pkglist was in no
+# manifest and no verifier looked at it. Listing it here is what makes a hand
+# edit visible, and what retires the gatebsd-pkglist.before-amnezia-20260730
+# sitting beside it.
+infra/freebsd-ci/gatebsd-pkglist             /usr/local/etc/poudriere.d/gatebsd-pkglist      0644 root wheel
+infra/freebsd-ci/update-freebsd-local-repo.sh /usr/local/sbin/update-freebsd-local-repo      0750 root wheel
+
+# poudriere's own configuration, and the same story a third time. It had three
+# writers: bootstrap.sh installed infra/freebsd-ci/poudriere.conf over it
+# wholesale, ci/host/configure_freebsd_mirror.sh rewrote eleven keys in place
+# with awk, and a hand edit added nine more. Nobody was comparing, because the
+# file was in no manifest -- so the repository's copy drifted into a fiction
+# that had never been deployed, and installing it would have dropped
+# PKG_REPO_SIGNING_KEY and left the stand publishing an unsigned repository
+# that the router's pkg refuses on `signature_type: "pubkey"`.
+#
+# Listing it here is also what makes leftovers_beside() look in
+# /usr/local/etc at all: three poudriere.conf.before-local-repo-20260714-*
+# copies had been sitting next to the live file since July, invisible to
+# retire-leftovers.sh for exactly that reason.
+infra/freebsd-ci/poudriere.conf              /usr/local/etc/poudriere.conf                   0644 root wheel
+
+# The two rc.d scripts the stand boots with, and the sudo rule the CI
+# dispatcher runs under. All three were hand-installed and in no manifest, so
+# the first thing that ever looked at them was the directory scan
+# deployment.scan now declares.
+#
+# stand_network_ready is the reason the stand has a network at boot: it puts the
+# address back and re-adds the default route if netif came up without them.
+# Until 14 August 2026 it did that for a lagg and an address written in by hand,
+# because the stand was a physical machine. That machine was decommissioned in
+# August 2026 and its disk reformatted; the stand is a virtual machine with
+# neither the lagg nor the address, and the script reads the interface, address
+# and router out of rc.conf instead of knowing them. Proven by running it on
+# FreeBSD with the address removed from a scratch interface: it put the address
+# back.
+#
+# A row here deploys a file; it does not enable a service. Between the move to
+# the VM and 16 August 2026 this script was installed, correct, and never ran:
+# `stand_network_ready_enable` was in no rc.conf and the script's own default is
+# NO, so `service ... enabled` answered no for weeks while this comment claimed
+# the stand had a network at boot because of it. A manifest row is evidence that
+# a file is in place, and of nothing else -- for an rc script, check `enabled`
+# on the machine as well.
+#
+# It was called n100_network_ready until 16 August 2026, after the model of a
+# machine that no longer exists. Renaming a deployed rc script is not a rename
+# of one row: rcorder(8) reads every file in that directory whatever it is
+# called, so the previous file had to be carried out of rc.d by the retirement
+# pass and its `_enable` variable replaced in rc.conf. A leftover there is a
+# second script running at boot, before anyone is watching.
+#
+# nginx_after_libvirt is gone with the same move. It ran no commands: it existed
+# for its REQUIRE line, which kept nginx from starting before libvirtd created
+# the bridge nginx bound to. The VM runs no libvirt and nginx no longer binds a
+# bridge address -- it listens on every interface. An ordering script naming a
+# service that will never exist is not harmless clutter here: rcorder(8) reads
+# every file in that directory, and a rule about a missing provider is a rule
+# nobody can check.
+infra/freebsd-ci/rc.d-stand_network_ready    /usr/local/etc/rc.d/stand_network_ready         0755 root wheel
+ci/host/ci_deployer.sudoers                  /usr/local/etc/sudoers.d/ci_deployer            0440 root wheel
+ci/host/wheel.sudoers                        /usr/local/etc/sudoers.d/wheel                  0440 root wheel
+
+# What lets poudriere build a pkgbase jail: the FreeBSD-base repository is
+# disabled by default and the stand's jail is `-m pkgbase`. Thirty-one bytes,
+# written by hand in July, and the whole build side of the stand stops working
+# if it goes missing -- which is a poor reason for it to have been the one file
+# in /usr/local/etc/pkg/repos that nothing was watching.
+infra/freebsd-ci/pkg-repos-FreeBSD.conf      /usr/local/etc/pkg/repos/FreeBSD.conf           0644 root wheel
+
+# mirror-sync-git was that known gap until 27 August 2026: scheduled by cron,
+# no source here, unmanaged. It stopped being academic when the copy on the
+# stand turned out to keep every previous version of every mirrored repository
+# forever -- 104 of them, 180 GB, back to 19 July. The pool filled, the release
+# mirror quietly stopped updating for four days, and nothing in this tree could
+# even show what the script did. It is carried here now, with the pruning it
+# always needed.
+infra/freebsd-ci/mirror-sync-git.sh          /usr/local/sbin/mirror-sync-git                 0750 root wheel
+
+# Log rotation for everything above. Absent entirely until 27 August 2026: five
+# logs appending for ever, the busiest of them every three minutes, onto the
+# root pool.
+infra/freebsd-ci/newsyslog-gatebsd-stand.conf /usr/local/etc/newsyslog.conf.d/gatebsd-stand.conf 0644 root wheel
+
+# The stand's networking, which existed only on the stand until 27 August 2026.
+#
+# hn0 and hn1 are in the same subnet, so the machine needs two FIBs and a pf
+# route-to rule to use both -- none of which rc.conf can express. All six files
+# were live and none was in any manifest row: verify-deployment.sh reported the
+# three under /usr/local as "files nothing accounts for", and the three in /etc
+# were not reported at all, because its scan roots stop at /usr/local. A rebuilt
+# stand would have come up on one leg without noticing the other was gone.
+#
+# pf is enabled here as a routing primitive, not as a firewall: pf.conf passes
+# everything and says so in its own comment.
+infra/freebsd-ci/hyperv_multihoming          /usr/local/etc/rc.d/hyperv_multihoming          0555 root wheel
+infra/freebsd-ci/hyperv-failover-realtek     /usr/local/sbin/hyperv-failover-realtek         0555 root wheel
+infra/freebsd-ci/hyperv-failover-wifi        /usr/local/sbin/hyperv-failover-wifi            0555 root wheel
+infra/freebsd-ci/stand-pf.conf               /etc/pf.conf                                    0600 root wheel
+infra/freebsd-ci/stand-pf.hyperv-primary.conf /etc/pf.hyperv-primary.conf                    0600 root wheel
+infra/freebsd-ci/stand-pf.hyperv-wifi.conf   /etc/pf.hyperv-wifi.conf                        0600 root wheel
+# The poudriere ports overlay.
+#
+# The stand's ports tree is a plain checkout of git.FreeBSD.org/ports.git, and
+# `poudriere ports -u` throws away anything edited inside it. Python security
+# backports therefore live here and are overlaid at build time. Amnezia ports
+# deliberately have no local rows: official amnezia-kmod 3.1, amnezia-tools 3.1
+# and amneziawg-go 3.1 provide both complete data paths.
+#
+# Registered once with:
+#   poudriere ports -c -p gatebsd -m null -M /usr/local/share/gatebsd/ports-overlay -f none
+# and selected per build with `-O gatebsd`. NOT with OVERLAYS= in poudriere.conf:
+# bulk.sh sources the config and then assigns OVERLAYS="" unconditionally, so a
+# setting there is a silent no-op that builds the upstream version while looking
+# configured. The tree name has no dash on purpose -- poudriere parses one as a
+# SETNAME.
+
+infra/freebsd-ci/ports-overlay/lang/python312/Makefile                    /usr/local/share/gatebsd/ports-overlay/lang/python312/Makefile                    0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/Makefile.version            /usr/local/share/gatebsd/ports-overlay/lang/python312/Makefile.version            0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/pkg-descr                   /usr/local/share/gatebsd/ports-overlay/lang/python312/pkg-descr                   0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/pkg-plist                   /usr/local/share/gatebsd/ports-overlay/lang/python312/pkg-plist                   0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/files/patch-Lib-imaplib.py  /usr/local/share/gatebsd/ports-overlay/lang/python312/files/patch-Lib-imaplib.py  0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/files/patch-Lib-poplib.py   /usr/local/share/gatebsd/ports-overlay/lang/python312/files/patch-Lib-poplib.py   0644 root wheel
+infra/freebsd-ci/ports-overlay/lang/python312/files/pkg-message.in       /usr/local/share/gatebsd/ports-overlay/lang/python312/files/pkg-message.in       0644 root wheel
+infra/forgejo/backup.sh                                                    /usr/local/sbin/gatebsd-forgejo-backup                                     0550 root wheel
+infra/forgejo/forgejo-backup.cron                                          /usr/local/etc/cron.d/forgejo-backup                                       0644 root wheel
+
+# Three rows left here on 14 August 2026 with the physical N100, and they are
+# named rather than silently dropped because each was doing something on that
+# machine that has no meaning on this one.
+#
+#   loader.conf         coretemp_load -- the Intel core temperature driver.
+#                       A Hyper-V guest has no coretemp to load.
+#   rc.conf.d-powerd    adaptive frequency scaling. The hypervisor host owns
+#                       the CPU frequency; a guest asking for it changes
+#                       nothing and runs a daemon for no reason.
+#   sysctl.conf.local   dev.hwpstate_intel.{0..3}.epp=80 -- four cores' Intel
+#                       energy-performance preference. The VM has two vCPUs and
+#                       none of those sysctls exist, so this file turns into
+#                       four errors at every boot.
+#
+# The last one is the reason this is a deletion rather than a "leave it, it is
+# harmless": a config that errors at boot is exactly the kind of noise that
+# teaches people to ignore boot output.

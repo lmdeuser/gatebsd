@@ -1,0 +1,4 @@
+# Backup images — excluded from git
+*.img.gz
+*.img
+*.gz

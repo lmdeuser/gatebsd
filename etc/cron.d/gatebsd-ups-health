@@ -1,0 +1,2 @@
+# A daily check leaves a failed UPS link unnoticed for almost 24 hours.
+*/5 * * * * root /usr/local/sbin/gatebsd-ups-health.sh

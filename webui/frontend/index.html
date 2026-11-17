@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="GateBSD — FreeBSD Network Gateway Control Panel" />
+    <meta name="theme-color" content="#0D1117" />
+    <title>GateBSD</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect rx='20' width='100' height='100' fill='%230D1117'/><text x='50' y='68' text-anchor='middle' font-size='48' font-family='system-ui' font-weight='700' fill='%23C41E3A'>G</text></svg>" />
+    <link rel="stylesheet" href="/styles.css?v=__GATEBSD_VERSION__" />
+    <link rel="stylesheet" href="/xterm.css" />
+    <script src="/lucide.min.js?v=__GATEBSD_VERSION__"></script>
+    <script src="/xterm.js"></script>
+    <script src="/xterm-addon-fit.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-logo">
+        <svg class="logo-icon" viewBox="0 0 448 512" fill="currentColor" style="width:30px;height:30px;color:var(--accent);">
+          <path d="M303.7 96.2c11.1-11.1 115.5-77 139.2-53.2 23.7 23.7-42.1 128.1-53.2 139.2-11.1 11.1-39.4.9-63.1-22.9-23.8-23.7-34.1-52-22.9-63.1zM109.9 68.1C73.6 47.5 22 24.6 5.6 41.1c-16.6 16.6 7.1 69.4 27.9 105.7 18.5-32.2 44.8-59.3 76.4-78.7zM406.7 174c3.3 11.3 2.7 20.7-2.7 26.1-20.3 20.3-87.5-27-109.3-70.1-18-32.3-11.1-53.4 14.9-48.7 5.7-3.6 12.3-7.6 19.6-11.6-29.8-15.5-63.6-24.3-99.5-24.3-119.1 0-215.6 96.5-215.6 215.6 0 119 96.5 215.6 215.6 215.6S445.3 380.1 445.3 261c0-38.4-10.1-74.5-27.7-105.8-3.9 7-7.6 13.3-10.9 18.8z"/>
+        </svg>
+        <div class="logo-text">
+          <h1><span style="color:#ffffff">Gate</span><span style="color:var(--accent)">BSD</span></h1>
+          <p>Powered by FreeBSD</p>
+        </div>
+      </div>
+      <div class="sidebar-version" id="sidebarVersion">
+        <span class="dot"></span>
+        <span>System active</span>
+      </div>
+      <nav class="sidebar-nav" id="sidebarNav">
+
+        <div class="nav-group">Dashboard</div>
+        <button data-view="overview" class="active"><i data-lucide="layout-dashboard"></i><span>Overview</span></button>
+        <button data-view="system" class="advanced-only"><i data-lucide="cpu"></i><span>System</span></button>
+
+        <div class="nav-group">Network</div>
+        <button data-view="wan"><i data-lucide="globe"></i><span>WAN</span></button>
+        <button data-view="failover"><i data-lucide="route"></i><span>Failover</span></button>
+        <button data-view="lan"><i data-lucide="network"></i><span>Local Network (LAN)</span></button>
+        <button data-view="adblock"><i data-lucide="badge-x"></i><span>AdBlock</span></button>
+        <button data-view="amnezia"><i data-lucide="lock"></i><span>Amnezia VPN</span></button>
+
+        <div class="nav-group">Security</div>
+        <button data-view="firewall"><i data-lucide="shield"></i><span>Firewall / PF</span></button>
+
+        <div class="nav-group">Tools</div>
+        <button data-view="logs" class="advanced-only"><i data-lucide="file-text"></i><span>Logs</span></button>
+        <button data-view="diagnostics"><i data-lucide="stethoscope"></i><span>Diagnostics</span></button>
+
+        <div class="nav-group">System</div>
+        <button data-view="ups"><i data-lucide="battery-charging"></i><span>UPS</span></button>
+        <button data-view="backups"><i data-lucide="archive-restore"></i><span>Backups</span></button>
+        <button data-view="history"><i data-lucide="history"></i><span>History</span></button>
+        <button data-view="admin"><i data-lucide="settings"></i><span>Settings</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <button id="logoutBtn"><i data-lucide="log-out"></i><span>Sign out</span></button>
+        <div class="sidebar-copyright">GateBSD v__GATEBSD_VERSION__<br>&copy; 2026 GateBSD Project</div>
+      </div>
+    </aside>
+
+    <div class="main-wrapper">
+      <header class="topbar">
+        <button class="menu-toggle" id="menuToggle" aria-label="Menu">
+          <i data-lucide="menu"></i>
+        </button>
+        <div class="view-heading">
+          <i data-lucide="menu" aria-hidden="true"></i>
+          <strong id="viewTitle">Overview</strong>
+        </div>
+        <div class="status-strip" id="statusStrip"></div>
+        <div class="live-indicator" id="liveIndicator">
+          <span class="live-dot"></span>
+          <span id="liveText">connecting…</span>
+        </div>
+        <button class="btn btn-ok recovery-button" type="button" onclick="doInternetRepair()" title="Diagnose and recover WAN, PPPoE, VPN, routes, and DNS">
+          <i data-lucide="heart-pulse"></i><span>Restore Connectivity</span>
+        </button>
+        <div class="dropdown-container">
+          <button class="topbar-icon" id="notificationBtn" type="button" title="Notifications" aria-label="Notifications">
+            <i data-lucide="bell"></i>
+            <span class="notification-badge" id="notifBadge"></span>
+          </button>
+          <div class="dropdown-menu" id="notificationDropdown"></div>
+        </div>
+        <div class="dropdown-container">
+          <div class="user-menu" id="userMenuBtn" style="cursor: pointer;"><i data-lucide="user-round"></i><span>admin</span><i data-lucide="chevron-down"></i></div>
+          <div class="dropdown-menu" id="userDropdown">
+            <button class="dropdown-item" id="changePasswordBtn"><i data-lucide="key"></i>Change Password</button>
+            <hr class="dropdown-divider">
+            <button class="dropdown-item" id="logoutDropdownBtn" style="color:var(--bad);"><i data-lucide="log-out"></i>Sign out</button>
+          </div>
+        </div>
+      </header>
+      <main>
+        <section class="summary-grid" id="summary"></section>
+        <section class="panel" id="content"></section>
+      </main>
+    </div>
+
+    <div class="toast-container" id="toasts"></div>
+    <div class="modal-overlay" id="modalOverlay" hidden>
+      <div class="modal" id="modal">
+        <div class="modal-header"><h3 id="modalTitle"></h3><button class="modal-close" id="modalClose">&times;</button></div>
+        <div class="modal-body" id="modalBody"></div>
+        <div class="modal-footer" id="modalFooter"></div>
+      </div>
+    </div>
+
+    <div class="cmd-overlay" id="cmdOverlay" hidden>
+      <div class="cmd-modal">
+        <div class="cmd-input-wrap">
+          <i data-lucide="search"></i>
+          <input type="text" id="cmdInput" placeholder="Search views, devices, settings..." autocomplete="off" />
+          <kbd>ESC</kbd>
+        </div>
+        <div class="cmd-results" id="cmdResults"></div>
+      </div>
+    </div>
+
+    <script src="/app.js?v=__GATEBSD_VERSION__"></script>
+  </body>
+</html>

@@ -1,0 +1,202 @@
+#!/bin/sh
+# Give a device its own identity the first time it boots.
+#
+# The product is delivered by writing one image to many mini PCs. Everything in
+# that image is identical on every unit, and some of it must not be: SSH host
+# keys, the management TLS certificate, the host UUID, and any credential that
+# shipped in the image. A fleet where every box presents the same host key is a
+# fleet where host-key verification proves nothing and one unit's key
+# impersonates all of them -- including the operator's own laptop connection.
+# It is not a hardening detail; it is the difference between a product and a
+# clone.
+#
+# Two design decisions are deliberate.
+#
+# Per-step markers, not one "provisioned" flag. First boot happens at a customer
+# site on hardware that gets unplugged. If power is lost between regenerating
+# the host keys and regenerating the certificate, a single flag either redoes
+# everything -- changing an identity the customer has already trusted -- or
+# skips everything, leaving the shipped certificate in place forever. Each step
+# records its own completion, so an interrupted run resumes exactly where it
+# stopped.
+#
+# Security steps fail closed, convenience steps fail open. If the device cannot
+# obtain its own host key or certificate, the management interface must not come
+# up with the image's; a device that is unreachable is recoverable, a fleet
+# sharing one identity is not. Growing the pool, on the other hand, can wait.
+#
+# Exit status: 0 provisioned or already provisioned, 1 a security step failed.
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+
+STATE_DIR=${GATEBSD_FIRSTBOOT_STATE:-/var/db/gatebsd-system/firstboot}
+TLS_DIR=${GATEBSD_TLS_DIR:-/usr/local/etc/gatebsd/tls}
+SSH_DIR=${GATEBSD_SSH_DIR:-/etc/ssh}
+HOSTID_FILE=${GATEBSD_HOSTID_FILE:-/etc/hostid}
+IDENTITY_FILE=${GATEBSD_IDENTITY_FILE:-/var/db/gatebsd-system/device-identity}
+ROOT_POOL=${GATEBSD_ROOT_POOL:-zroot}
+UPS_BOOTSTRAP=${GATEBSD_UPS_BOOTSTRAP:-/usr/local/sbin/gatebsd-ups-bootstrap}
+
+FAILED=0
+
+log() {
+    logger -t gatebsd-firstboot -- "$*" 2>/dev/null || true
+    printf '%s\n' "$*"
+}
+
+# Ownership is applied only when running as root. The provisioner is also
+# exercised by the test suite as an ordinary user, and a script that refuses to
+# run outside production is a script whose behaviour nobody has verified.
+safe_mkdir() {
+    install -d -m "$2" "$1" 2>/dev/null || return 1
+    [ "$(id -u)" != 0 ] || chown root:wheel "$1" 2>/dev/null || true
+    return 0
+}
+
+done_marker() { printf '%s/%s.done' "$STATE_DIR" "$1"; }
+step_done()   { [ -f "$(done_marker "$1")" ]; }
+
+# The marker is written only after the step has succeeded, so an interrupted
+# step is retried rather than assumed complete.
+mark_done() {
+    _tmp=$(mktemp "${STATE_DIR}/.marker.XXXXXX") || return 1
+    printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$_tmp"
+    mv -f "$_tmp" "$(done_marker "$1")"
+}
+
+run_step() {
+    _name=$1
+    _critical=$2
+    if step_done "$_name"; then
+        return 0
+    fi
+    log "first boot: $_name"
+    if "step_$_name"; then
+        mark_done "$_name" || log "WARNING: $_name succeeded but its marker could not be written"
+        return 0
+    fi
+    if [ "$_critical" = critical ]; then
+        log "CRITICAL: $_name failed; this device must not run with the image's identity"
+        FAILED=1
+    else
+        log "WARNING: $_name failed; continuing"
+    fi
+    return 0
+}
+
+# --- steps ----------------------------------------------------------------
+
+# Every unit boots with the same host keys until this runs. Removing them and
+# letting sshd's own keygen recreate them is what makes each unit distinct.
+step_ssh_host_keys() {
+    [ -d "$SSH_DIR" ] || return 1
+    find "$SSH_DIR" -maxdepth 1 -name 'ssh_host_*key' -o -maxdepth 1 -name 'ssh_host_*key.pub' \
+        > "${STATE_DIR}/.ssh-keys" 2>/dev/null || true
+    while IFS= read -r _key; do
+        [ -n "$_key" ] || continue
+        rm -f "$_key"
+    done < "${STATE_DIR}/.ssh-keys"
+    rm -f "${STATE_DIR}/.ssh-keys"
+    ssh-keygen -A >/dev/null 2>&1 || return 1
+    # Prove it: an empty key set would leave sshd unable to start at all.
+    [ -f "$SSH_DIR/ssh_host_ed25519_key" ] || return 1
+    return 0
+}
+
+# The management UI is HTTPS. A shared certificate means a shared private key,
+# and a shared private key means any customer can decrypt any other's session.
+step_tls_certificate() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    safe_mkdir "$TLS_DIR" 0700 || return 1
+    _key="$TLS_DIR/key.pem"
+    _cert="$TLS_DIR/cert.pem"
+    _tmpkey=$(mktemp "${TLS_DIR}/.key.XXXXXX") || return 1
+    _tmpcert=$(mktemp "${TLS_DIR}/.cert.XXXXXX") || {
+        rm -f "$_tmpkey"
+        return 1
+    }
+    if ! openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+            -keyout "$_tmpkey" -out "$_tmpcert" \
+            -subj "/CN=$(hostname 2>/dev/null || printf gatebsd)" >/dev/null 2>&1; then
+        rm -f "$_tmpkey" "$_tmpcert"
+        return 1
+    fi
+    chmod 0600 "$_tmpkey"
+    chmod 0644 "$_tmpcert"
+    mv -f "$_tmpkey" "$_key" && mv -f "$_tmpcert" "$_cert"
+}
+
+# ZFS uses the host ID to decide whether a pool is imported by this machine.
+# Identical host IDs across a fleet make that check meaningless.
+step_hostid() {
+    _uuid=$(uuidgen 2>/dev/null) || return 1
+    [ -n "$_uuid" ] || return 1
+    _tmp=$(mktemp "${STATE_DIR}/.hostid.XXXXXX") || return 1
+    printf '%s\n' "$_uuid" > "$_tmp"
+    chmod 0644 "$_tmp"
+    mv -f "$_tmp" "$HOSTID_FILE"
+}
+
+# A support identity the customer can read off the UI and quote in a ticket,
+# derived from the hardware rather than the image.
+step_device_identity() {
+    _serial=$(kenv -q smbios.system.serial 2>/dev/null || printf '')
+    case "$_serial" in
+        ''|*[Tt]o' 'be' 'filled*|*[Uu]nknown*|Default*|None) _serial='' ;;
+    esac
+    [ -n "$_serial" ] || _serial=$(uuidgen 2>/dev/null) || return 1
+    safe_mkdir "$(dirname "$IDENTITY_FILE")" 0750 || return 1
+    _tmp=$(mktemp "$(dirname "$IDENTITY_FILE")/.identity.XXXXXX") || return 1
+    {
+        printf 'serial=%s\n' "$_serial"
+        printf 'provisioned=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf 'image_version=%s\n' \
+            "$(cat /usr/local/share/gatebsd/VERSION 2>/dev/null || printf unknown)"
+    } > "$_tmp"
+    chmod 0640 "$_tmp"
+    mv -f "$_tmp" "$IDENTITY_FILE"
+}
+
+# Credentials embedded in a cloned image would identify the fleet, not a
+# device.  Existing complete configurations are accepted unchanged; only an
+# empty device is provisioned, and a partial set fails closed.
+step_ups_credentials() {
+    [ -x "$UPS_BOOTSTRAP" ] || return 1
+    "$UPS_BOOTSTRAP"
+}
+
+# The image is sized for the smallest disk it must fit. Every unit larger than
+# that would otherwise waste the difference, and a full pool is an outage.
+step_grow_pool() {
+    command -v zpool >/dev/null 2>&1 || return 1
+    _dev=$(zpool list -v -H "$ROOT_POOL" 2>/dev/null | awk '$1 ~ /p[0-9]+$/ {print $1; exit}')
+    [ -n "$_dev" ] || return 1
+    _disk=$(printf '%s' "$_dev" | sed -e 's|^/dev/||' -e 's/p[0-9]*$//')
+    _part=$(printf '%s' "$_dev" | sed -n 's/.*p\([0-9]*\)$/\1/p')
+    [ -n "$_disk" ] && [ -n "$_part" ] || return 1
+    gpart recover "$_disk" >/dev/null 2>&1 || true
+    gpart resize -i "$_part" "$_disk" >/dev/null 2>&1 || true
+    zpool online -e "$ROOT_POOL" "$_dev" >/dev/null 2>&1 || return 1
+}
+
+# --- run ------------------------------------------------------------------
+
+safe_mkdir "$STATE_DIR" 0700 || {
+    printf 'cannot create %s\n' "$STATE_DIR" >&2
+    exit 1
+}
+
+run_step ssh_host_keys   critical
+run_step tls_certificate critical
+run_step hostid          critical
+run_step ups_credentials critical
+run_step device_identity optional
+run_step grow_pool       optional
+
+if [ "$FAILED" -ne 0 ]; then
+    log "first boot did not complete; the device still carries image identity"
+    exit 1
+fi
+log "first boot complete"
+exit 0

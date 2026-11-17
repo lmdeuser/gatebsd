@@ -1,0 +1,104 @@
+#!/bin/sh
+
+# PROVIDE: stand_network_ready
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+# Boot-time check that the stand actually came up on the network.
+#
+# It used to assemble lagg0 and write the physical stand's address in by hand,
+# on a machine where that address lived on a lagg with one member. That machine
+# was decommissioned in August 2026 and its disk reformatted; the stand is a
+# virtual machine with neither the lagg nor the address. A script carrying a dead machine's address is worse than no script -- it
+# runs at boot, before anyone is watching, and the archetype this repository
+# keeps paying for is exactly that: something wrong and dormant until a restart.
+#
+# So nothing is hardcoded any more. The interface, address and router are read
+# from rc.conf, which is where they are declared, and this only puts back what
+# rc.conf already said. If rc.conf says nothing, neither does this -- an empty
+# declaration is a configuration choice, not a fault to repair.
+#
+# BEFORE: is gone with nut_upsmon and libvirtd, neither of which the VM runs.
+
+. /etc/rc.subr
+
+name="stand_network_ready"
+rcvar="stand_network_ready_enable"
+start_cmd="stand_network_ready_start"
+stop_cmd=":"
+
+load_rc_config "$name"
+: ${stand_network_ready_enable:="NO"}
+: ${stand_network_ready_interface:=""}
+
+# The interface to check. Given explicitly, or the one rc.conf gives a static
+# inet address to -- the stand has exactly one of those, the others are DHCP.
+stand_network_ready_find_iface()
+{
+    [ -z "$stand_network_ready_interface" ] || {
+        printf '%s' "$stand_network_ready_interface"
+        return 0
+    }
+    for _var in $(set | sed -n 's/^\(ifconfig_[a-z][a-z0-9]*\)=.*/\1/p'); do
+        eval _val=\"\$$_var\"
+        case "$_val" in
+            *inet\ [0-9]*) printf '%s' "${_var#ifconfig_}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Where the outcome is recorded, and why a record is needed at all.
+#
+# rcorder puts this script directly after NETWORKING and syslogd twenty-eight
+# places later, so every `logger` call here is made before there is anywhere to
+# write: on a real boot the messages are simply lost. Measured on the stand
+# 16 August 2026 -- the script is enabled, the boot is clean, and /var/log holds
+# nothing from it at all. A safety net whose whole purpose is to act at boot,
+# before anyone is watching, must not be indistinguishable from one that never
+# ran; that is this repository's signature defect wearing another hat.
+#
+# So the outcome also goes to a file. /var/run is emptied at boot, which is the
+# property that matters: the file being there means THIS boot ran it, not some
+# earlier one. logger is kept for the interactive case, where syslog is up.
+STATE_FILE=${stand_network_ready_state:-/var/run/stand-network-ready}
+
+record()
+{
+    echo "$(date '+%Y-%m-%dT%H:%M:%S%z') $*" > "$STATE_FILE" 2>/dev/null || true
+    logger -t stand-network "$*"
+}
+
+stand_network_ready_start()
+{
+    _iface=$(stand_network_ready_find_iface) || {
+        record "no statically addressed interface in rc.conf; nothing to check"
+        return 0
+    }
+
+    if ! ifconfig "$_iface" >/dev/null 2>&1; then
+        logger -t stand-network "$_iface is missing"
+        return 1
+    fi
+
+    eval _spec=\"\$ifconfig_$_iface\"
+    _addr=$(printf '%s\n' "$_spec" | sed -n 's/.*inet \([0-9.]*\).*/\1/p')
+    _mask=$(printf '%s\n' "$_spec" | sed -n 's/.*netmask \([0-9a-fx.]*\).*/\1/p')
+
+    if [ -n "$_addr" ] && ! ifconfig "$_iface" | grep -q "inet $_addr "; then
+        logger -t stand-network "$_iface lost $_addr; putting it back"
+        ifconfig "$_iface" inet "$_addr" ${_mask:+netmask $_mask}
+    fi
+
+    if [ -n "$defaultrouter" ] && [ "$defaultrouter" != "NO" ]; then
+        if ! route -n get default >/dev/null 2>&1; then
+            logger -t stand-network "no default route; adding $defaultrouter"
+            route add default "$defaultrouter"
+        fi
+    fi
+
+    record "network ready on $_iface${_addr:+ ($_addr)}"
+    return 0
+}
+
+run_rc_command "$1"

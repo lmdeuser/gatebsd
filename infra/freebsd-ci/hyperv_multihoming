@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# Routing for the stand's three legs, which a plain rc.conf cannot express.
+#
+# The machine has hn0 (Wi-Fi switch, 10.88.0.166), hn1 (wired Realtek,
+# 10.88.0.193) and hn2 (the private Hyper-V network, 198.51.100.11). The first
+# two sit in the SAME subnet, so one routing table cannot hold a sensible
+# default for both: whichever leg wins takes all traffic and the other becomes
+# decoration. Two FIBs solve it -- hn0 is moved to FIB 1 with its own default,
+# hn1 keeps FIB 0 -- and that is what this does.
+#
+# It waits for hn1 to actually carry its address before touching anything.
+# Without the wait the routes are installed against an interface that has not
+# finished coming up, and they silently do not take: the script reports success
+# and the machine has no default route. Thirty seconds, then it gives up rather
+# than looping for ever at boot.
+#
+# Carried in the repository since 27 August 2026. Before that it existed only
+# on the stand, enabled in rc.conf, and verify-deployment.sh reported it as a
+# file nothing accounts for -- which is exactly what it was. A rebuilt stand
+# would have come up with one leg and no idea it was missing the other.
+#
+# PROVIDE: hyperv_multihoming
+# REQUIRE: NETWORKING
+# BEFORE: SERVERS
+. /etc/rc.subr
+name=hyperv_multihoming
+rcvar=hyperv_multihoming_enable
+start_cmd=hyperv_multihoming_start
+stop_cmd=:
+
+hyperv_multihoming_start()
+{
+  i=0
+  while ! /sbin/ifconfig hn1 inet | /usr/bin/grep -q 'inet 10.88.0.193'; do
+    i=$((i + 1))
+    [ "$i" -ge 30 ] && return 1
+    sleep 1
+  done
+
+  /sbin/ifconfig hn0 fib 1
+  /usr/sbin/setfib 1 /sbin/route -q delete default 2>/dev/null || true
+  /usr/sbin/setfib 1 /sbin/route -q delete -net 10.88.0.0/24 2>/dev/null || true
+  /usr/sbin/setfib 1 /sbin/route -q delete -net 198.51.100.0/24 2>/dev/null || true
+  /usr/sbin/setfib 1 /sbin/route -q add -net 10.88.0.0/24 -iface hn0
+  /usr/sbin/setfib 1 /sbin/route -q add -net 198.51.100.0/24 -iface hn2
+  /usr/sbin/setfib 1 /sbin/route -q add default 10.88.0.1
+
+  /sbin/route -q delete default 2>/dev/null || true
+  /sbin/route -q delete -net 10.88.0.0/24 2>/dev/null || true
+  /sbin/route -q add -net 10.88.0.0/24 -iface hn1
+  /sbin/route -q add default 10.88.0.1
+}
+
+load_rc_config "$name"
+run_rc_command "$1"

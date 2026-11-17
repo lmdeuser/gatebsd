@@ -1,0 +1,67 @@
+wan_if="ng0"
+backup_if="ue0"
+lan_if="re1"
+vpn_if="awg0"
+
+lan_net="10.88.0.0/24"
+
+# --- TABLES ---
+# Private ranges, multicast, and link-local (useful for ZeroConf)
+table <local_nets> const { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 }
+
+# (Policy bypass routing table lives in the kernel FIB rather than PF)
+
+# --- OPTIONS ---
+set skip on lo
+set block-policy drop
+
+# --- NORMALIZATION ---
+
+scrub in all
+scrub on ng0 all max-mss 1240
+scrub on awg0 all max-mss 1240
+
+# --- NAT ---
+# PF applies NAT dynamically according to the outbound interface selected by the kernel
+nat on $wan_if from $lan_net to any -> ($wan_if)
+nat on $backup_if from $lan_net to any tag LAN_TO_BACKUP -> ($backup_if)
+
+# Double NAT for the VPN tunnel (disable if your peer routes the LAN subnet directly)
+nat on $vpn_if from $lan_net to any -> ($vpn_if)
+
+# --- DNS INTERCEPTION ---
+# Redirect outbound port 53 DNS queries from LAN clients to the local resolver.
+# <local_nets> is excluded intentionally so internal DNS servers remain reachable.
+# Translation rules (rdr/nat) must precede filter rules in pf.conf.
+rdr on $lan_if proto { tcp udp } from $lan_net to ! <local_nets> port 53 -> ($lan_if)
+
+# NUT UPS server — LAN clients
+pass in quick on $lan_if proto tcp from $lan_net to ($lan_if) port 3493 keep state
+
+# --- FILTERING ---
+block in all
+
+# Block outbound DNS-over-TLS (port 853) before pass-quick rules so clients cannot
+# bypass the local resolver; pf stops at the first matching quick rule.
+block in quick on $lan_if proto { tcp udp } from $lan_net to ! <local_nets> port 853
+
+# Block LAN clients from accessing the backup LTE modem admin UI
+block out quick on $backup_if proto tcp to ($backup_if:network) port { 80 443 } tagged LAN_TO_BACKUP
+
+# Permit legitimate outbound traffic from the gateway itself
+pass out quick keep state
+
+# 1. LAN L2/L3 traffic
+pass in quick on $lan_if from $lan_net to $lan_net keep state
+
+# 2. DHCP requests
+pass in quick on $lan_if proto udp from any port 68 to any port 67 keep state
+
+# 3. Anti-lockout: full management access to the gateway itself
+pass in quick on $lan_if from $lan_net to ($lan_if) keep state
+
+# 4. Internal traffic to other private subnets and multicast
+pass in quick on $lan_if from $lan_net to <local_nets> keep state
+
+# 5. Internet and VPN traffic (kernel routing table selects awg0 vs ng0)
+pass in quick on $lan_if from $lan_net to any keep state

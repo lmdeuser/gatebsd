@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# Publish the backup operator's state, as it reported it over SMS.
+#
+# Reads the ZTE dongle and writes /var/run/gatebsd/operator.json, so that
+# `backup_ok=false` can say which of its three very different causes it is:
+# an air alert the operator throttles everyone for, an unpaid tariff, or an
+# actual fault. Read-only against the modem -- nothing here deletes a message.
+#
+# Runs from cron with a PATH that has no /usr/local/bin (this has bitten us
+# before, with awg), so every path below is absolute.
+set -eu
+
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+BACKEND=${GATEBSD_BACKEND_DIR:-/usr/local/share/gatebsd/webui/backend}
+
+[ -x "$PYTHON_LAUNCHER" ] || { echo "Python launcher is unavailable" >&2; exit 1; }
+
+exec env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin \
+    HOME=/root LANG=C.UTF-8 \
+    GATEBSD_MODEM_HOST="${GATEBSD_MODEM_HOST:-192.168.0.1}" \
+    GATEBSD_MODEM_TIMEOUT="${GATEBSD_MODEM_TIMEOUT:-10}" \
+    GATEBSD_SMS_COUNT="${GATEBSD_SMS_COUNT:-40}" \
+    GATEBSD_OPERATOR_STATE="${GATEBSD_OPERATOR_STATE:-/var/run/gatebsd/operator.json}" \
+    GATEBSD_RUN_DIR="${GATEBSD_RUN_DIR:-/var/run/gatebsd}" \
+    PYTHONPATH="$BACKEND" \
+    "$PYTHON_LAUNCHER" -m gatebsd_ui.sms_monitor "$@"

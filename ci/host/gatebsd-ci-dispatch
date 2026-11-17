@@ -1,0 +1,74 @@
+#!/bin/sh
+set -euf
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+log()
+{
+    logger -t gatebsd-ci-dispatch -- "$*"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >&2
+}
+
+health()
+{
+    failed=0
+    echo '=== GateBSD infrastructure health ==='
+    curl -fsS http://127.0.0.1/health/live >/dev/null && echo 'nginx: OK' || { echo 'nginx: FAIL'; failed=1; }
+    curl -fsS http://127.0.0.1/health/ready >/dev/null && echo 'mirror: OK' || { echo 'mirror: FAIL'; failed=1; }
+    # `zpool status -x POOL` reports "pool 'NAME' is healthy"; the phrase
+    # "all pools are healthy" is only produced when no pool is named. Matching
+    # the wrong one made this check fail on a healthy pool.
+    zpool status -x tank | grep -qE "is healthy|all pools are healthy" \
+        && echo 'zfs: OK' || { echo 'zfs: FAIL'; failed=1; }
+    poudriere jail -l -n | grep -qx freebsd_151_amd64 && echo 'build jail: OK' || { echo 'build jail: FAIL'; failed=1; }
+    [ "$(df -k /tank | awk 'NR == 2 {print $4}')" -gt 10485760 ] && echo 'disk: OK' || { echo 'disk: LOW'; failed=1; }
+    [ "$failed" -eq 0 ]
+}
+
+command=${SSH_ORIGINAL_COMMAND:-}
+[ -n "$command" ] || {
+    echo 'Direct shell access is disabled for ci_deployer.' >&2
+    exit 64
+}
+
+set -- $command
+operation=${1:-}
+shift || true
+log "operation=$operation"
+
+case "$operation" in
+    health|ci-health)
+        [ "$#" -eq 0 ] || exit 64
+        health
+        ;;
+    ci-mirror-status)
+        [ "$#" -eq 0 ] || exit 64
+        # Reads the published verdict. It used to run a health check, first as
+        # `mirror-health-check-v2` and then as the managed checker, and running
+        # one is not reporting one: both write the readiness flag, so asking
+        # for the status decided it. An operation named "status" must not be
+        # able to block releases.
+        #
+        # It could not have worked either way. This runs as ci_deployer, uid
+        # 1002 group operator; the checkers are 0750 root:wheel and
+        # /tank/mirror/status is root:www 0755. No execute, no write. The
+        # status files are 0644, which is what this account can actually do.
+        exec /usr/local/sbin/mirror-status-report
+        ;;
+    ci-build)
+        [ "$#" -eq 1 ] || exit 64
+        exec sudo -n /usr/local/libexec/gatebsd-ci-build "$1"
+        ;;
+    ci-verify-deployment)
+        # Asked before a release is built, against the commit being built. The
+        # verifier reads files this account cannot read -- managed scripts are
+        # 0750 root:wheel -- so it goes through sudo like the build does.
+        [ "$#" -eq 1 ] || exit 64
+        exec sudo -n /usr/local/libexec/gatebsd-ci-build --verify-only "$1"
+        ;;
+    *)
+        echo "Denied CI operation: $operation" >&2
+        exit 64
+        ;;
+esac

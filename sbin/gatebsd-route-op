@@ -1,0 +1,521 @@
+#!/bin/sh
+# Serialize and apply GateBSD runtime route mutations.
+set -eu
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+# The fixed PATH is what keeps this root-only route mutator from being pointed
+# at somebody else's route(8). The regression harness has to substitute route(8)
+# to *execute* an underlay transaction instead of reading it, so a prefix is
+# honoured when -- and only when -- the caller also sets GATEBSD_ALLOW_TEST_PATH.
+# Both come from the environment, which for a mutating action is already root's
+# alone, and that same environment names the RU helper and the Python launcher
+# outright; this reaches no further than they do.
+if [ "${GATEBSD_ALLOW_TEST_PATH:-0}" = 1 ] && [ -n "${GATEBSD_TEST_PATH_PREFIX:-}" ]; then
+    PATH="${GATEBSD_TEST_PATH_PREFIX}:${PATH}"
+fi
+export PATH
+
+CONF=${GATEBSD_GATEWAY_CONF:-/usr/local/etc/amnezia/gateway.conf}
+LOCK_FILE=${GATEBSD_GATEWAY_LOCK_FILE:-/var/run/gatebsd/gatewayctl.lock}
+_RU_TABLE_ENV_SET=${RU_TABLE+x}
+_RU_TABLE_ENV=${RU_TABLE-}
+_RU_STATE_ENV_SET=${RU_STATE_FILE+x}
+_RU_STATE_ENV=${RU_STATE_FILE-}
+RU_ROUTES_HELPER=${GATEBSD_RU_ROUTES_HELPER:-/usr/local/sbin/ru-routes.sh}
+UNBOUND_CONTROL=${GATEBSD_UNBOUND_CONTROL:-unbound-control}
+UNBOUND_CONF=${GATEBSD_UNBOUND_CONF:-/usr/local/etc/unbound/unbound.conf}
+PYTHON_LAUNCHER=${GATEBSD_PYTHON_LAUNCHER:-/usr/local/libexec/gatebsd-python}
+PYTHONPATH_VALUE=${GATEBSD_PYTHONPATH:-/usr/local/share/gatebsd/webui/backend}
+ENDPOINT_DNS_CACHE=${GATEBSD_ENDPOINT_DNS_CACHE:-/var/db/gatebsd-system/endpoint-dns-cache}
+
+fail() { printf 'gatebsd-route-op: %s\n' "$*" >&2; exit 1; }
+
+safe_source() {
+    _path=$1
+    [ -f "$_path" ] && [ ! -L "$_path" ] || fail "unsafe or missing config: $_path"
+    _uid=$(stat -f '%u' "$_path" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$_path" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || fail "config must be owned by root: $_path"
+    case "$_mode" in
+        *[2367][0-7]|*[0-7][2367]) fail "config must not be group/world writable: $_path" ;;
+    esac
+    # shellcheck disable=SC1090 -- validated root-owned configuration.
+    . "$_path"
+}
+
+is_ipv4() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 4 {exit 1}
+        { for (i=1; i<=4; i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1 }
+    '
+}
+
+is_hostname() {
+    _host=$1
+    [ -n "$_host" ] && [ ${#_host} -le 253 ] || return 1
+    case "$_host" in
+        ''|.*|*..*|*-|*.|-*|*[[:space:]]*|*[[:cntrl:]]*|*/*|*:*|*\**|*\?*|*_*|*\"*|*\'*|*\;*|*\\*|*\[*|*\]*) return 1 ;;
+    esac
+}
+
+is_iface() {
+    _iface=$1
+    [ -n "$_iface" ] && [ ${#_iface} -le 32 ] || return 1
+    case "$_iface" in *[!A-Za-z0-9_.-]*|[0-9.-]*) return 1 ;; esac
+}
+
+safe_source "$CONF"
+if [ "$_RU_TABLE_ENV_SET" = x ]; then RU_TABLE=$_RU_TABLE_ENV; else RU_TABLE=${RU_TABLE:-/usr/local/etc/amnezia/ru_bypass.table}; fi
+if [ "$_RU_STATE_ENV_SET" = x ]; then RU_STATE_FILE=$_RU_STATE_ENV; else RU_STATE_FILE=${RU_STATE_FILE:-/var/db/gatebsd-system/ru-routes.applied}; fi
+: "${VPN_ENDPOINT_HOST:=}"
+: "${VPN_IF:=awg0}"
+is_iface "$VPN_IF" || fail "invalid VPN interface: $VPN_IF"
+
+ACTION=${1:-}
+[ -n "$ACTION" ] || fail "missing action"
+shift || true
+
+# Root and the route lock are two different requirements, and the resolver flush
+# is the action that tells them apart: it needs root (the control socket is
+# root's) and must *not* queue behind a route transaction. The watchdog does not
+# run under the lock, so a flush that waited for it would fail with "already
+# locked" during exactly the event that makes the flush necessary -- a route
+# change in progress. Flushing a moment early costs nothing; not flushing costs
+# the customer a site that stays broken after the outage ended.
+case "$ACTION" in
+    endpoint-ip|check-default)  _mutating=0; _needs_lock=0 ;;
+    flush-resolver-negative)    _mutating=1; _needs_lock=0 ;;
+    *)                          _mutating=1; _needs_lock=1 ;;
+esac
+[ "$_mutating" -eq 0 ] || [ "$(id -u)" -eq 0 ] || fail "root required"
+
+if [ "$_needs_lock" -eq 1 ] && [ "${GATEBSD_GATEWAY_LOCK_HELD:-0}" != 1 ]; then
+    command -v lockf >/dev/null 2>&1 || fail "lockf is required"
+    # Validate what is already there; only a missing directory is created.
+    #
+    # `install -d -o root -g gatebsd -m 0750` re-applies owner, group and mode
+    # to a directory that already exists, and /var/run/gatebsd is not this
+    # tool's: the agent's socket lives in it and the panel reaches that socket
+    # through the group bits. gatewayctl learned this the expensive way -- its
+    # apply re-owned the directory on every run, including the automatic one at
+    # boot, and the panel answered "agent unavailable" to every request from
+    # then until somebody noticed. That fix landed in gatewayctl as
+    # ensure_shared_dir and never reached here, where the same call sits on the
+    # path of every single route operation.
+    #
+    # It also fails outright on a machine without a `gatebsd` group -- a build
+    # host, a rehearsal rig -- for a directory that was already correct, which
+    # is how it was found.
+    _lock_dir=$(dirname "$LOCK_FILE")
+    if [ -e "$_lock_dir" ] || [ -L "$_lock_dir" ]; then
+        [ -d "$_lock_dir" ] && [ ! -L "$_lock_dir" ] || fail "unsafe route lock directory: $_lock_dir"
+        _uid=$(stat -f '%u' "$_lock_dir" 2>/dev/null || printf '%s' -1)
+        _mode=$(stat -f '%Lp' "$_lock_dir" 2>/dev/null || printf '%s' 777)
+        [ "$_uid" = 0 ] || fail "route lock directory must be root-owned: $_lock_dir"
+        case "$_mode" in *[2367][0-7]|*[0-7][2367]) fail "route lock directory must not be group/world writable: $_lock_dir" ;; esac
+    else
+        install -d -o root -g gatebsd -m 0750 "$_lock_dir" \
+            || fail "cannot create route lock directory: $_lock_dir"
+    fi
+    if [ -e "$LOCK_FILE" ] || [ -L "$LOCK_FILE" ]; then
+        [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ] || fail "unsafe route lock: $LOCK_FILE"
+    fi
+    exec env -i \
+        PATH="$PATH" \
+        GATEBSD_GATEWAY_LOCK_HELD=1 \
+        GATEBSD_GATEWAY_CONF="$CONF" \
+        GATEBSD_GATEWAY_LOCK_FILE="$LOCK_FILE" \
+        GATEBSD_RU_ROUTES_HELPER="$RU_ROUTES_HELPER" \
+        GATEBSD_PYTHON_LAUNCHER="$PYTHON_LAUNCHER" \
+        GATEBSD_PYTHONPATH="$PYTHONPATH_VALUE" \
+        GATEBSD_ENDPOINT_DNS_CACHE="$ENDPOINT_DNS_CACHE" \
+        RU_TABLE="$RU_TABLE" \
+        RU_STATE_FILE="$RU_STATE_FILE" \
+        lockf -k -t 5 "$LOCK_FILE" "$0" "$ACTION" "$@"
+fi
+
+vpn_endpoint_ip() {
+    _host=${VPN_ENDPOINT_HOST:-}
+    [ -n "$_host" ] || return 1
+    if is_ipv4 "$_host"; then
+        printf '%s\n' "$_host"
+        return 0
+    fi
+    is_hostname "$_host" || return 1
+    [ -x "$PYTHON_LAUNCHER" ] || return 1
+    _resolved=$(env -i PATH="$PATH" PYTHONPATH="$PYTHONPATH_VALUE" \
+        "$PYTHON_LAUNCHER" -m gatebsd_ui.resolver \
+        --server 1.1.1.1 --server 9.9.9.9 --server 77.88.8.8 \
+        --os-fallback --cache-file "$ENDPOINT_DNS_CACHE" "$_host" \
+        2>/dev/null | sed -n '1p')
+    is_ipv4 "$_resolved" && printf '%s\n' "$_resolved"
+}
+
+replace_default_gateway() {
+    is_ipv4 "$1" || return 1
+    route change default "$1" >/dev/null 2>&1 || route add default "$1" >/dev/null 2>&1
+}
+
+replace_default_interface() {
+    is_iface "$1" || return 1
+    route change default -interface "$1" >/dev/null 2>&1 || route add default -interface "$1" >/dev/null 2>&1
+}
+
+clear_default() {
+    # Deliberately withdraw the default route. Used only when the alternative is
+    # leaving a default route that points somewhere known to be dead.
+    route delete default >/dev/null 2>&1 || true
+}
+
+current_default_gateway() {
+    route -n get default 2>/dev/null | awk '/gateway:/ {print $2; exit}'
+}
+
+# Is this exact address routed by a host route of its own?
+#
+# `route -n get -host X` always answers as long as some route matches, so its
+# exit status says nothing. What distinguishes the two cases is the destination
+# it reports back: the address itself when a /32 exists, and the covering route
+# -- `0.0.0.0`, or `default` -- when it does not. Verified on FreeBSD 15.1,
+# 7 August, rather than assumed.
+host_route_present() {
+    [ -n "${1:-}" ] || return 1
+    route -n get -host "$1" 2>/dev/null | awk -v want="$1" '
+        $1 == "destination:" && $2 == want { found = 1 }
+        END { exit found ? 0 : 1 }'
+}
+
+# Which address is pinned right now, remembered as an address.
+#
+# The pin is a /32 through the WAN that keeps the tunnel's own packets from
+# being routed into the tunnel. Removing it needs the address that was pinned,
+# and until this record existed the only way to get one was to resolve
+# VPN_ENDPOINT_HOST out of gateway.conf again -- which answers "where does the
+# box point now", not "what did we pin". Those are the same address exactly
+# until a profile is switched, and switching is when it matters: `awg_activate`
+# writes the new endpoint into gateway.conf *before* the rebuild, so by the time
+# anything could unpin the old one its address is already gone. Every switch
+# left a permanent host route around the tunnel, and nothing on the box could
+# name it afterwards, let alone remove it.
+#
+# A dead provider makes it worse rather than better. When the retired profile's
+# endpoint was a hostname and that hostname has stopped resolving -- which is
+# precisely what happens to a server that died -- the address is not merely
+# forgotten, it is uncomputable. An address remembered as an address survives
+# that; a name does not.
+#
+# It lives beside the lock deliberately. The record is only meaningful while the
+# routing table it describes is, and both are emptied by a reboot, so the
+# runtime directory is exactly the right lifetime. Deriving it from LOCK_FILE
+# also means it follows the lock through the re-exec above and through the test
+# harness's redirection without a second variable to keep in step.
+PIN_RECORD="$(dirname "$LOCK_FILE")/endpoint_pin"
+
+# Never non-zero. This script runs under `set -eu`, and callers read it with a
+# bare `_x=$(pinned_endpoint)`: a function that answered "no record" with a
+# failing status would kill the route transaction on the assignment itself,
+# which is the trap `awk` on a missing file has already sprung here once.
+# "Nothing is pinned" is an answer, not an error.
+pinned_endpoint() {
+    [ -f "$PIN_RECORD" ] && [ ! -L "$PIN_RECORD" ] || return 0
+    _recorded=$(sed -n '1p' "$PIN_RECORD" 2>/dev/null || true)
+    is_ipv4 "$_recorded" || return 0
+    printf '%s\n' "$_recorded"
+}
+
+# Failing to record the pin is a failure, and saying otherwise re-opens the very
+# leak this record exists to close.
+#
+# The first version swallowed every error here -- a write that failed, a `mv`
+# that failed -- and returned success, on the reasoning that bookkeeping should
+# never be the thing that breaks routing. That reasoning is wrong in this
+# direction: if the table ends up pinning B while the record still says A, then
+# the next switch cannot name B, and B is leaked permanently. A full filesystem
+# or a read-only runtime directory would quietly restore the original defect and
+# no test would notice. So this reports, and `pin_endpoint` acts on it.
+remember_pin() {
+    _tmp="${PIN_RECORD}.$$"
+    printf '%s\n' "$1" > "$_tmp" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+    chmod 0644 "$_tmp" 2>/dev/null || true
+    mv -f "$_tmp" "$PIN_RECORD" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+    return 0
+}
+
+# The record may only be dropped once the route it describes is gone. Dropping
+# it beside a route that is still installed destroys the only name that route
+# has -- the same untrackable leak, arriving from the other end.
+forget_pin() {
+    rm -f "$PIN_RECORD" 2>/dev/null || return 1
+    return 0
+}
+
+# Move the pin; never leave a second one behind.
+#
+# Stated as one operation because that is what the caller means. `cmd_apply`
+# pins on every apply, and an apply is also how a switched profile arrives, so
+# "pin the endpoint" has always had to mean "and stop pinning the last one" --
+# it just had no way to say it.
+# The order is: install the new pin, record it, then withdraw the old one.
+#
+# Withdrawing first is how the first version had it, and it is wrong twice over.
+# If the new pin then fails to install there is no pin at all, and the record
+# still names an address that has already been deleted -- so the box is left
+# without the route the tunnel needs AND without a truthful account of what it
+# has. Installing first means the worst case is the state we started this whole
+# change to fix, one extra route, and that one is recoverable because the record
+# names it.
+#
+# The record is written before the old pin is withdrawn for the same reason: at
+# every instant between the two, the record must name a route that exists. If
+# the record cannot be written the new pin is withdrawn again and the old one is
+# left exactly where it was, which is a state the box already knows how to be in.
+pin_endpoint() {
+    _iface=$1
+    _gateway=$2
+    is_iface "$_iface" || return 1
+    is_ipv4 "$_gateway" || return 1
+    _endpoint=$(vpn_endpoint_ip) || return 1
+    _previous=$(pinned_endpoint)
+
+    route change -host "$_endpoint" "$_gateway" >/dev/null 2>&1 \
+        || route add -host "$_endpoint" "$_gateway" >/dev/null 2>&1 || return 1
+
+    if [ "$_previous" = "$_endpoint" ]; then
+        # Nothing moved -- `cmd_apply` pins on every apply and most applies
+        # change nothing, and an underlay switch re-pins the same address
+        # through a different next hop. Re-recording it is harmless, but
+        # deleting anything here would put a hole in a path that is in use.
+        remember_pin "$_endpoint" || return 1
+        return 0
+    fi
+
+    remember_pin "$_endpoint" || {
+        route delete -host "$_endpoint" >/dev/null 2>&1 || true
+        return 1
+    }
+    [ -z "$_previous" ] || route delete -host "$_previous" >/dev/null 2>&1 || true
+    return 0
+}
+
+# Both the remembered address and the currently configured one, because they can
+# legitimately differ -- a pin taken before a profile switch, an unpin after --
+# and leaving either behind is the leak this exists to close.
+# The record is dropped only once the route it names is actually gone.
+#
+# Forgetting it unconditionally was the same leak from the other end: a delete
+# that failed left the route installed and destroyed the only name the box had
+# for it. `route delete` on an address that is not routed also "fails", and that
+# case is indistinguishable here -- so the record is verified against the table
+# rather than against the exit status, which is the same discipline as measuring
+# the world instead of the command.
+unpin_endpoint() {
+    _recorded=$(pinned_endpoint)
+    _endpoint=$(vpn_endpoint_ip 2>/dev/null || true)
+    for _target in "$_recorded" "$_endpoint"; do
+        [ -n "$_target" ] || continue
+        route delete -host "$_target" >/dev/null 2>&1 || true
+    done
+    if [ -n "$_recorded" ] && host_route_present "$_recorded"; then
+        printf 'gatebsd-route-op: endpoint pin %s could not be removed; keeping the record that names it\n' \
+            "$_recorded" >&2
+        return 1
+    fi
+    forget_pin
+}
+
+# The resolver remembers failures, and a route change makes that memory wrong.
+#
+# On 6 August the tunnel was out of the path from 06:14 to 08:28. During those
+# two hours unbound asked for google.com over a broken path, got nothing, and
+# cached the nothing. The tunnel came back, the watchdog said PRIMARY, the panel
+# went green and was right -- and google.com stayed unreachable for another
+# fifteen minutes, because the only thing that had not been told the outage was
+# over was the resolver. One `flush_negative` fixed it instantly; 127 negative
+# entries came out.
+#
+# It belongs here, in the helper both gatewayctl and the watchdog already call
+# for privileged work, rather than as a second copy in each of them. This
+# project has paid for the copies before: `install -d` was cleaned up in one
+# place and left in five.
+#
+# Never fatal. A resolver that will not answer its control socket must not stop
+# a route change -- but it must be audible, so this returns non-zero and the
+# caller logs it.
+flush_resolver_negative() {
+    command -v "$UNBOUND_CONTROL" >/dev/null 2>&1 || return 0
+    "$UNBOUND_CONTROL" -c "$UNBOUND_CONF" flush_negative >/dev/null 2>&1
+}
+
+# Report the gateway currently pinned for the VPN endpoint, so a failed
+# transaction can restore that exact value instead of destroying the pin.
+endpoint_pinned_gateway() {
+    _endpoint=$(vpn_endpoint_ip 2>/dev/null || true)
+    [ -n "$_endpoint" ] || return 1
+    route -n get -host "$_endpoint" 2>/dev/null | awk '/gateway:/ {print $2; exit}'
+}
+
+ru_apply() {
+    _iface=$1
+    _gateway=$2
+    is_iface "$_iface" || return 1
+    is_ipv4 "$_gateway" || return 1
+    [ -r "$RU_TABLE" ] || return 0
+    [ -x "$RU_ROUTES_HELPER" ] || return 1
+    GATEBSD_ACTIVE_WAN_IF="$_iface" GATEBSD_ACTIVE_WAN_GW="$_gateway" \
+        RU_TABLE="$RU_TABLE" RU_STATE_FILE="$RU_STATE_FILE" \
+        GATEBSD_RU_ROUTES_HELPER="$RU_ROUTES_HELPER" \
+        service ru_bypass restart
+}
+
+ru_clear() {
+    [ -x "$RU_ROUTES_HELPER" ] || return 1
+    RU_TABLE="$RU_TABLE" RU_STATE_FILE="$RU_STATE_FILE" \
+        GATEBSD_RU_ROUTES_HELPER="$RU_ROUTES_HELPER" \
+        service ru_bypass schedule-clear
+}
+
+switch_underlay() {
+    _new_iface=$1
+    _new_gateway=$2
+    _old_iface=$3
+    _old_gateway=$4
+    _vpn_iface=$5
+    is_iface "$_new_iface" && is_ipv4 "$_new_gateway" && is_iface "$_vpn_iface" || return 1
+    [ "$_old_gateway" = - ] || { is_iface "$_old_iface" && is_ipv4 "$_old_gateway"; } || return 1
+
+    _default_iface=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+    if [ "$_default_iface" != "$_vpn_iface" ]; then
+        replace_default_gateway "$_new_gateway" || return 1
+        # The tunnel is not in the default route right now -- but its endpoint
+        # pin still is, and it still names the underlay being left behind. A
+        # host route to the peer via a dead gateway is worse than none: the
+        # tunnel's own outer packets are the one thing that must not follow the
+        # link that just failed, and awg keeps trying to hand them to it. So the
+        # pin follows the underlay here too, not only on the VPN-default path.
+        #
+        # Only an existing pin is moved. Creating one here would resolve the
+        # endpoint -- a DNS lookup, on a link chosen because the previous one
+        # died -- to install a route for a tunnel nobody has asked to raise.
+        if is_ipv4 "$(endpoint_pinned_gateway 2>/dev/null || true)"; then
+            pin_endpoint "$_new_iface" "$_new_gateway" || true
+        fi
+        return 0
+    fi
+
+    # Capture the pin we are about to overwrite so rollback can restore it.
+    # The caller passes "-" for the old gateway whenever it could not read one,
+    # which is the normal case during failover (we are failing over precisely
+    # because the old link is down). Treating that as "there was no pin" and
+    # deleting the endpoint route strands the tunnel's own outer packets inside
+    # the tunnel, and the handshake cannot recover without a full re-apply.
+    _prior_pin=$(endpoint_pinned_gateway 2>/dev/null || true)
+
+    pin_endpoint "$_new_iface" "$_new_gateway" || return 1
+    if ru_apply "$_new_iface" "$_new_gateway"; then
+        return 0
+    fi
+
+    if is_ipv4 "$_prior_pin"; then
+        route change -host "$(vpn_endpoint_ip)" "$_prior_pin" >/dev/null 2>&1 \
+            || route add -host "$(vpn_endpoint_ip)" "$_prior_pin" >/dev/null 2>&1 \
+            || true
+    elif [ "$_old_gateway" = - ]; then
+        unpin_endpoint
+    fi
+    if [ "$_old_gateway" != - ]; then
+        pin_endpoint "$_old_iface" "$_old_gateway" || true
+        ru_apply "$_old_iface" "$_old_gateway" || true
+    fi
+    return 1
+}
+
+vpn_rollback() {
+    _wan_gateway=$1
+    _vpn_iface=$2
+    is_ipv4 "$_wan_gateway" && is_iface "$_vpn_iface" || return 1
+    replace_default_gateway "$_wan_gateway" || return 1
+    if ru_clear; then
+        # ru_clear schedules the supervised worker. Verify the default we just
+        # installed before returning; ru-routes.sh rejects 0.0.0.0/0, so the
+        # later clear cannot withdraw this default as a side effect.
+        if ! is_ipv4 "$(current_default_gateway)"; then
+            replace_default_gateway "$_wan_gateway" || return 1
+        fi
+        return 0
+    fi
+    replace_default_interface "$_vpn_iface" || true
+    return 1
+}
+
+enable_vpn() {
+    _wan_iface=$1
+    _wan_gateway=$2
+    _vpn_iface=$3
+    is_iface "$_wan_iface" && is_ipv4 "$_wan_gateway" && is_iface "$_vpn_iface" || return 1
+    pin_endpoint "$_wan_iface" "$_wan_gateway" || return 1
+    replace_default_interface "$_vpn_iface" || return 1
+    if ru_apply "$_wan_iface" "$_wan_gateway"; then
+        return 0
+    fi
+    replace_default_gateway "$_wan_gateway" || true
+    ru_clear || true
+    return 1
+}
+
+case "$ACTION" in
+    endpoint-ip)
+        [ $# -eq 0 ] || fail "endpoint-ip takes no arguments"
+        vpn_endpoint_ip || fail "VPN endpoint is unavailable"
+        ;;
+    check-default)
+        [ $# -eq 1 ] || fail "check-default requires an interface"
+        is_iface "$1" || fail "invalid interface"
+        _current=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+        [ "$_current" = "$1" ]
+        ;;
+    set-default-gw)
+        [ $# -eq 1 ] || fail "set-default-gw requires a gateway"
+        replace_default_gateway "$1" || fail "cannot set default gateway"
+        ;;
+    set-default-if)
+        [ $# -eq 1 ] || fail "set-default-if requires an interface"
+        replace_default_interface "$1" || fail "cannot set default interface"
+        ;;
+    clear-default)
+        [ $# -eq 0 ] || fail "clear-default takes no arguments"
+        clear_default
+        ;;
+    pin-endpoint)
+        [ $# -eq 2 ] || fail "pin-endpoint requires interface and gateway"
+        pin_endpoint "$1" "$2" || fail "cannot pin VPN endpoint"
+        ;;
+    unpin-endpoint)
+        [ $# -eq 0 ] || fail "unpin-endpoint takes no arguments"
+        unpin_endpoint
+        ;;
+    flush-resolver-negative)
+        [ $# -eq 0 ] || fail "flush-resolver-negative takes no arguments"
+        flush_resolver_negative || fail "cannot flush resolver negative cache"
+        ;;
+    ru-apply)
+        [ $# -eq 2 ] || fail "ru-apply requires interface and gateway"
+        ru_apply "$1" "$2" || fail "RU route transaction failed"
+        ;;
+    ru-clear)
+        [ $# -eq 0 ] || fail "ru-clear takes no arguments"
+        ru_clear || fail "cannot clear RU routes"
+        ;;
+    switch-underlay)
+        [ $# -eq 5 ] || fail "switch-underlay requires new-if new-gw old-if old-gw vpn-if"
+        switch_underlay "$1" "$2" "$3" "$4" "$5" || fail "underlay route transaction failed"
+        ;;
+    vpn-rollback)
+        [ $# -eq 2 ] || fail "vpn-rollback requires WAN gateway and VPN interface"
+        vpn_rollback "$1" "$2" || fail "VPN rollback transaction failed"
+        ;;
+    enable-vpn)
+        [ $# -eq 3 ] || fail "enable-vpn requires WAN interface, WAN gateway and VPN interface"
+        enable_vpn "$1" "$2" "$3" || fail "VPN route transaction failed"
+        ;;
+    *) fail "unknown action: $ACTION" ;;
+esac

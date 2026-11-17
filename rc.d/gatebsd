@@ -1,0 +1,193 @@
+#!/bin/sh
+# PROVIDE: gatebsd
+# REQUIRE: NETWORKING gatebsd_lock_cleanup
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="gatebsd"
+rcvar="gatebsd_enable"
+desc="GateBSD router management UI"
+
+config_file=/usr/local/etc/gatebsd/gatebsd.conf
+if [ -e "$config_file" ]; then
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] || { echo "Unsafe GateBSD config: $config_file" >&2; exit 1; }
+    _uid=$(stat -f '%u' "$config_file" 2>/dev/null || printf '%s' -1)
+    _mode=$(stat -f '%Lp' "$config_file" 2>/dev/null || printf '%s' 777)
+    [ "$_uid" = 0 ] || { echo "GateBSD config must be root-owned" >&2; exit 1; }
+    case "$_mode" in *[2367][0-7]|*[0-7][2367]) echo "GateBSD config must not be group/world writable" >&2; exit 1 ;; esac
+    # shellcheck disable=SC1090 -- fixed root-owned configuration path.
+    . "$config_file"
+fi
+load_rc_config "$name"
+: ${gatebsd_enable:="NO"}
+: ${gatebsd_user:="gatebsd"}
+: ${gatebsd_group:="gatebsd"}
+: ${gatebsd_basedir:="/usr/local/share/gatebsd/webui/backend"}
+: ${gatebsd_socket:="/var/run/gatebsd/agent.sock"}
+: ${gatebsd_db:="/var/db/gatebsd"}
+: ${gatebsd_host:="127.0.0.1"}
+: ${gatebsd_port:="8080"}
+: ${gatebsd_sample_interval:="60"}
+: ${gatebsd_auth_mode:="system"}
+: ${gatebsd_admin_group:="wheel"}
+
+agent_pidfile=/var/run/gatebsd/agent.pid
+ui_pidfile=/var/run/gatebsd/ui.pid
+# daemon(8) supervises both processes and records its own pid in these. They are
+# separate processes from the pidfiles above, and the stop path must signal them
+# first -- see the comment on gatebsd_stop.
+agent_supervisor_pidfile=/var/run/gatebsd/agent-supervisor.pid
+ui_supervisor_pidfile=/var/run/gatebsd/ui-supervisor.pid
+start_cmd="gatebsd_start"
+stop_cmd="gatebsd_stop"
+status_cmd="gatebsd_status"
+
+# Confirm both that the recorded process exists AND that it is the process the
+# pidfile claims. Without the command check, a stale pidfile whose PID the kernel
+# has since recycled makes gatebsd_stop kill an unrelated process -- and because
+# gatebsd-healthcheck.sh restarts this service from cron every five minutes, that
+# is automated. If the recycled PID belonged to mpd5, stopping GateBSD would drop
+# PPPoE and take the site's only uplink offline, with the log pointing nowhere
+# near the cause. Every sibling rc script and gatebsd-lock-cleanup already do
+# this; only this one did not.
+is_running() {
+    _pidfile=$1
+    _pattern=$2
+    [ -f "$_pidfile" ] && [ ! -L "$_pidfile" ] || return 1
+    _pid=$(cat "$_pidfile" 2>/dev/null) || return 1
+    case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_pid" -gt 1 ] 2>/dev/null || return 1
+    kill -0 "$_pid" 2>/dev/null || return 1
+    [ -n "$_pattern" ] || return 0
+    _command=$(ps -p "$_pid" -o command= 2>/dev/null || true)
+    case "$_command" in
+        *"$_pattern"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+agent_running() { is_running "$agent_pidfile" gatebsd_ui.agent; }
+ui_running() { is_running "$ui_pidfile" gatebsd_ui.server; }
+
+# daemon(8) reports itself as "daemon: <launcher>[pid] (daemon)". The module
+# name its child was given does not appear there, so a supervisor is recognised
+# by the launcher path instead. That is specific enough for its only job --
+# refusing a recycled PID -- because the sole processes it can match are this
+# service's own two supervisors, and both are stopped together anyway.
+supervisor_running() {
+    _pidfile=$1
+    [ -f "$_pidfile" ] && [ ! -L "$_pidfile" ] || return 1
+    _pid=$(cat "$_pidfile" 2>/dev/null) || return 1
+    case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_pid" -gt 1 ] 2>/dev/null || return 1
+    kill -0 "$_pid" 2>/dev/null || return 1
+    _command=$(ps -p "$_pid" -o command= 2>/dev/null || true)
+    case "$_command" in
+        daemon:*gatebsd-python*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wait_for_socket() {
+    _i=0
+    while [ "$_i" -lt 40 ] && [ ! -S "$gatebsd_socket" ]; do
+        sleep 0.25
+        _i=$((_i + 1))
+    done
+    [ -S "$gatebsd_socket" ]
+}
+
+gatebsd_start() {
+    umask 027
+    pw usershow "$gatebsd_user" >/dev/null 2>&1 || { echo "Missing service account: $gatebsd_user" >&2; return 1; }
+    pw groupshow "$gatebsd_group" >/dev/null 2>&1 || { echo "Missing service group: $gatebsd_group" >&2; return 1; }
+    for _item in "$agent_pidfile:gatebsd_ui.agent" "$ui_pidfile:gatebsd_ui.server"; do
+        _pf=${_item%:*}; _pat=${_item##*:}
+        if [ -f "$_pf" ] && ! is_running "$_pf" "$_pat"; then rm -f "$_pf"; fi
+    done
+    install -d -o root -g "$gatebsd_group" -m 0750 /var/run/gatebsd
+    install -d -o "$gatebsd_user" -g "$gatebsd_group" -m 0750 "$gatebsd_db"
+
+    _started_agent=0
+    if ! agent_running; then
+        if [ -e "$gatebsd_socket" ] && [ ! -S "$gatebsd_socket" ]; then
+            echo "Refusing unsafe agent socket path: $gatebsd_socket" >&2
+            return 1
+        fi
+        rm -f "$gatebsd_socket"
+        echo "Starting GateBSD agent."
+        env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin HOME=/root LANG=C.UTF-8 \
+            PYTHONPATH="$gatebsd_basedir" GATEBSD_DB_DIR="$gatebsd_db" \
+            GATEBSD_SAMPLE_INTERVAL="$gatebsd_sample_interval" GATEBSD_SERVICE_GROUP="$gatebsd_group" \
+            GATEBSD_ADMIN_GROUP="$gatebsd_admin_group" GATEBSD_AUTH_MODE="$gatebsd_auth_mode" \
+            /usr/sbin/daemon -r -R 5 -P "$agent_supervisor_pidfile" \
+            -p "$agent_pidfile" -o /var/log/gatebsd-agent.log \
+            /usr/local/libexec/gatebsd-python -m gatebsd_ui.agent --socket "$gatebsd_socket" || return 1
+        wait_for_socket || { echo "GateBSD agent socket was not created" >&2; gatebsd_stop; return 1; }
+        _started_agent=1
+    fi
+    chown root:"$gatebsd_group" "$gatebsd_socket"
+    chmod 0660 "$gatebsd_socket"
+
+    if ! ui_running; then
+        echo "Starting GateBSD UI on ${gatebsd_host}:${gatebsd_port}."
+        if ! env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin HOME=/nonexistent LANG=C.UTF-8 \
+            PYTHONPATH="$gatebsd_basedir" GATEBSD_DB_DIR="$gatebsd_db" GATEBSD_SOCKET="$gatebsd_socket" \
+            GATEBSD_HOST="$gatebsd_host" GATEBSD_PORT="$gatebsd_port" GATEBSD_AUTH_MODE="$gatebsd_auth_mode" \
+            GATEBSD_SERVICE_USER="$gatebsd_user" \
+            /usr/sbin/daemon -u "$gatebsd_user" -r -R 5 -P "$ui_supervisor_pidfile" \
+            -p "$ui_pidfile" -o /var/log/gatebsd-ui.log \
+            /usr/local/libexec/gatebsd-python -m gatebsd_ui.server; then
+            [ "$_started_agent" -eq 0 ] || gatebsd_stop
+            return 1
+        fi
+    fi
+}
+
+gatebsd_stop() {
+    echo "Stopping GateBSD."
+    # The supervisors go first. Verified on FreeBSD 15.1: daemon(8) -r restarts
+    # its child after *any* exit, status 0 included, so signalling the child
+    # alone gets it back five seconds later and the stop only looks like it
+    # worked. A TERM to the supervisor is passed down, so the child still shuts
+    # down through its own handler.
+    for _sv in "$ui_supervisor_pidfile" "$agent_supervisor_pidfile"; do
+        if supervisor_running "$_sv"; then kill -TERM "$(cat "$_sv")" 2>/dev/null || true; fi
+    done
+    for _item in "$ui_pidfile:gatebsd_ui.server" "$agent_pidfile:gatebsd_ui.agent"; do
+        _pf=${_item%:*}; _pat=${_item##*:}
+        # Give the supervised shutdown a bounded moment before insisting. This
+        # also runs on the shutdown path, so it must not be able to stall a
+        # reboot: five seconds each, then the direct signal below.
+        _wait=0
+        while is_running "$_pf" "$_pat" && [ "$_wait" -lt 10 ]; do
+            sleep 0.5
+            _wait=$((_wait + 1))
+        done
+        # Only signal a PID that is verifiably still our own process.
+        if is_running "$_pf" "$_pat"; then kill "$(cat "$_pf")" 2>/dev/null || true; fi
+        rm -f "$_pf"
+    done
+    rm -f "$ui_supervisor_pidfile" "$agent_supervisor_pidfile"
+    [ ! -S "$gatebsd_socket" ] || rm -f "$gatebsd_socket"
+}
+
+gatebsd_status() {
+    _rc=0
+    for _item in "agent:$agent_pidfile:gatebsd_ui.agent" "ui:$ui_pidfile:gatebsd_ui.server"; do
+        _label=${_item%%:*}
+        _rest=${_item#*:}
+        _pf=${_rest%:*}
+        _pat=${_rest##*:}
+        if is_running "$_pf" "$_pat"; then
+            echo "GateBSD ${_label} is running as pid $(cat "$_pf")"
+        else
+            echo "GateBSD ${_label} is not running"
+            _rc=1
+        fi
+    done
+    return "$_rc"
+}
+
+run_rc_command "$1"

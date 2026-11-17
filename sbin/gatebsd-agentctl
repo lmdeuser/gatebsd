@@ -1,0 +1,227 @@
+#!/bin/sh
+set -eu
+
+PATH=${GATEBSD_PATH:-/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin}
+export PATH
+
+fail() { echo "gatebsd-agentctl: $*" >&2; exit 64; }
+[ "$(id -u)" -eq 0 ] || fail "root privileges are required"
+ACTION=${1:-}
+[ "$#" -ge 1 ] || fail "an action is required"
+shift
+
+NL='
+'
+CR=$(printf '\r')
+TAB=$(printf '\t')
+for _arg in "$ACTION" "$@"; do
+    case "$_arg" in
+        *"$NL"*|*"$CR"*|*"$TAB"*|*[[:cntrl:]]*) fail "control characters are not allowed in arguments" ;;
+    esac
+done
+
+service_name() {
+    case "$1" in
+        gatebsd|gatebsd_failover|gatewayctl_apply|gatebsd_reverse_ssh|ru_bypass|amnezia|nginx|sshd|unbound|pf|mpd5|isc-dhcpd|nut|nut_upsmon|cron|ntpd|smartd) ;;
+        *) fail "service is not allowed: $1" ;;
+    esac
+}
+
+prune_newest_files() {
+    _prune_dir=$1
+    _prune_glob=$2
+    _prune_keep=$3
+    if [ -d "$_prune_dir" ] && [ ! -L "$_prune_dir" ] \
+            && command -v find >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 \
+            && command -v sort >/dev/null 2>&1 && command -v awk >/dev/null 2>&1; then
+        find "$_prune_dir" -maxdepth 1 -type f -name "$_prune_glob" -exec stat -f '%m %N' {} + 2>/dev/null |
+            sort -rn |
+            awk -v keep="$_prune_keep" 'NR > keep { sub(/^[0-9]+ /, ""); print }' |
+            while IFS= read -r _stale_file; do
+                [ -n "$_stale_file" ] || continue
+                rm -f -- "$_stale_file"
+            done
+    fi
+}
+
+case "$ACTION" in
+    service-status)
+        [ "$#" -eq 1 ] || fail "service-status requires one service"
+        service_name "$1"
+        exec service "$1" onestatus
+        ;;
+    service-reload)
+        [ "$#" -eq 1 ] || fail "service-reload requires one service"
+        case "$1" in nginx|sshd) ;; *) fail "reload is not allowed: $1" ;; esac
+        exec service "$1" reload
+        ;;
+    service-restart)
+        [ "$#" -eq 1 ] || fail "service-restart requires one service"
+        case "$1" in gatebsd|nginx|unbound) ;; *) fail "restart is not allowed: $1" ;; esac
+        exec service "$1" restart
+        ;;
+    pf-show)
+        [ "$#" -eq 0 ] || fail "pf-show takes no arguments"
+        pfctl -s info
+        pfctl -s rules
+        pfctl -s nat
+        ;;
+    pf-check)
+        [ "$#" -eq 0 ] || fail "pf-check takes no arguments"
+        exec pfctl -nf /etc/pf.conf
+        ;;
+    ssh-check)
+        [ "$#" -eq 0 ] || fail "ssh-check takes no arguments"
+        exec sshd -t
+        ;;
+    nginx-check)
+        [ "$#" -eq 0 ] || fail "nginx-check takes no arguments"
+        exec nginx -t
+        ;;
+    unbound-check)
+        [ "$#" -eq 0 ] || fail "unbound-check takes no arguments"
+        exec unbound-checkconf /usr/local/etc/unbound/unbound.conf
+        ;;
+    pkg-audit)
+        [ "$#" -eq 0 ] || fail "pkg-audit takes no arguments"
+        exec pkg audit -F
+        ;;
+    pkg-check)
+        [ "$#" -eq 0 ] || fail "pkg-check takes no arguments"
+        exec pkg check -d
+        ;;
+    pkg-dry-run)
+        [ "$#" -eq 0 ] || fail "pkg-dry-run takes no arguments"
+        exec pkg upgrade -n
+        ;;
+    pkg-security-updates)
+        [ "$#" -eq 0 ] || fail "pkg-security-updates takes no arguments"
+        exec pkg install -y -f -r gatebsd-ports rsync p5-Authen-SASL python312 py312-sqlite3 amneziawg-go nginx
+        ;;
+    pkg-retire-legacy)
+        [ "$#" -eq 0 ] || fail "pkg-retire-legacy takes no arguments"
+        for _legacy_pkg in py311-sqlite3 py311-packaging python311 git; do
+            if pkg info -e "$_legacy_pkg" >/dev/null 2>&1; then
+                pkg delete -y "$_legacy_pkg" || fail "cannot retire legacy package: $_legacy_pkg"
+            fi
+        done
+        ;;
+    pkg-fetch)
+        [ "$#" -eq 0 ] || fail "pkg-fetch takes no arguments"
+        _fetch_dir=${GATEBSD_PKG_FETCH_DIR:-/var/tmp}
+        pkg update -r gatebsd-releases
+        pkg fetch -y -r gatebsd-releases -o "$_fetch_dir" gatebsd
+        prune_newest_files "$_fetch_dir" 'gatebsd-*.pkg' 2
+        prune_newest_files "$_fetch_dir/All" 'gatebsd-*.pkg' 2
+        ;;
+    gatebsd-upgrade)
+        [ "$#" -eq 1 ] || fail "gatebsd-upgrade requires one package"
+        _fetch_dir=${GATEBSD_PKG_FETCH_DIR:-/var/tmp}
+        _pkg_arg=$1
+        case "$_pkg_arg" in
+            "${_fetch_dir%/}"/All/gatebsd-*.pkg)
+                _pkg_base=${_pkg_arg#"${_fetch_dir%/}"/All/}
+                ;;
+            "${_fetch_dir%/}"/gatebsd-*.pkg)
+                _pkg_base=${_pkg_arg#"${_fetch_dir%/}"/}
+                ;;
+            *)
+                fail "gatebsd-upgrade package must reside under ${_fetch_dir%/}/ or ${_fetch_dir%/}/All/"
+                ;;
+        esac
+        case "$_pkg_base" in
+            gatebsd-*.pkg) ;;
+            *) fail "invalid gatebsd package name: $_pkg_base" ;;
+        esac
+        case "$_pkg_base" in
+            ''|*[!A-Za-z0-9_.+-]*|*/*|*..*) fail "unsafe gatebsd package name: $_pkg_base" ;;
+        esac
+        [ ! -L "$_pkg_arg" ] || fail "target package must not be a symlink: $_pkg_arg"
+        export GATEBSD_REQUIRE_REPO_HASH=1
+        exec gatebsd-upgrade "$_pkg_arg"
+        ;;
+    gatewayctl-apply)
+        [ "$#" -eq 0 ] || fail "gatewayctl-apply takes no arguments"
+        exec /usr/local/sbin/gatewayctl apply
+        ;;
+    config-migrate)
+        [ "$#" -eq 0 ] || fail "config-migrate takes no arguments"
+        exec gatebsd-config-migrate
+        ;;
+    firstboot)
+        [ "$#" -eq 0 ] || fail "firstboot takes no arguments"
+        exec gatebsd-firstboot
+        ;;
+    freebsd-update-fetch)
+        [ "$#" -eq 0 ] || fail "freebsd-update-fetch takes no arguments"
+        exec freebsd-update fetch --not-running-from-cron
+        ;;
+    freebsd-update-install)
+        [ "$#" -eq 0 ] || fail "freebsd-update-install takes no arguments"
+        exec freebsd-update install
+        ;;
+    backup-create)
+        [ "$#" -eq 0 ] || fail "backup-create takes no arguments"
+        exec gatebsd-backup.sh
+        ;;
+    backup-fetch)
+        [ "$#" -eq 1 ] || fail "backup-fetch requires one final image name"
+        case "$1" in gatebsd-*.img.gz) ;; *) fail "invalid image name" ;; esac
+        case "$1" in *[!A-Za-z0-9_.:-]*) fail "unsafe image name" ;; esac
+        exec cat "/var/backups/gatebsd-image/$1"
+        ;;
+    be-list)
+        [ "$#" -eq 0 ] || fail "be-list takes no arguments"
+        exec bectl list
+        ;;
+    be-create)
+        [ "$#" -eq 1 ] || fail "be-create requires a boot environment name"
+        case "$1" in gatebsd-*) ;; *) fail "boot environment name must start with gatebsd-" ;; esac
+        case "$1" in *[!A-Za-z0-9_.:-]*) fail "unsafe boot environment name" ;; esac
+        exec bectl create "$1"
+        ;;
+    be-destroy)
+        [ "$#" -eq 1 ] || fail "be-destroy requires a boot environment name"
+        case "$1" in gatebsd-*) ;; *) fail "boot environment name must start with gatebsd-" ;; esac
+        case "$1" in *[!A-Za-z0-9_.:-]*) fail "unsafe boot environment name" ;; esac
+        _be_active=$(bectl list -H 2>/dev/null | awk -v name="$1" '$1 == name {print $2}')
+        [ -n "$_be_active" ] || fail "boot environment not found: $1"
+        case "$_be_active" in *N*|*R*) fail "refusing to destroy active boot environment: $1 ($_be_active)" ;; esac
+        exec bectl destroy -o "$1"
+        ;;
+    disk-usage)
+        [ "$#" -eq 0 ] || fail "disk-usage takes no arguments"
+        df -h / /var/tmp
+        bectl list
+        du -sh /var/backups/gatebsd /var/backups/gatebsd-image /var/tmp 2>/dev/null || true
+        ls -lh /var/backups/gatebsd /var/backups/gatebsd-image 2>/dev/null || true
+        ;;
+    image-backup-prune)
+        [ "$#" -le 1 ] || fail "image-backup-prune takes at most one keep count"
+        _img_keep=${1:-1}
+        case "$_img_keep" in 0|1|2|3) ;; *) fail "keep count must be 0..3" ;; esac
+        prune_newest_files "${GATEBSD_IMAGE_BACKUP_DIR:-/var/backups/gatebsd-image}" 'gatebsd-*.img.gz' "$_img_keep"
+        ;;
+    system-reboot)
+        [ "$#" -eq 0 ] || fail "system-reboot takes no arguments"
+        exec shutdown -r now
+        ;;
+    read-file)
+        [ "$#" -eq 1 ] || fail "read-file requires one allowed path"
+        case "$1" in
+            /etc/pf.conf|/etc/rc.conf|/etc/sysctl.conf|/etc/ssh/sshd_config|/usr/local/etc/sudoers|/usr/local/etc/nginx/nginx.conf|/usr/local/etc/nginx/conf.d/gatebsd.conf|/usr/local/etc/unbound/unbound.conf|/usr/local/etc/gatebsd/gatebsd.conf|/usr/local/etc/amnezia/gateway.conf)
+                exec cat "$1"
+                ;;
+            *) fail "file is not in the read allowlist" ;;
+        esac
+        ;;
+    stat-file)
+        [ "$#" -eq 1 ] || fail "stat-file requires one absolute path"
+        case "$1" in /*) ;; *) fail "path must be absolute" ;; esac
+        NL='
+'
+        case "$1" in *..*|*"$NL"*) fail "unsafe path" ;; esac
+        exec stat -f '%Su:%Sg %Lp %HT %N' "$1"
+        ;;
+    *) fail "unknown action: $ACTION" ;;
+esac

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Build Stand Services</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, sans-serif;
+      background: Canvas;
+      color: CanvasText;
+    }
+    body {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 48px 24px;
+    }
+    h1 { margin: 0 0 8px; }
+    p { color: GrayText; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-top: 32px;
+    }
+    a {
+      display: block;
+      padding: 18px;
+      border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+      border-radius: 10px;
+      color: LinkText;
+      text-decoration: none;
+    }
+    a:hover { border-color: LinkText; }
+    strong { display: block; margin-bottom: 6px; }
+    span { color: GrayText; font-size: 0.92rem; }
+  </style>
+</head>
+<body>
+  <h1>Build Stand Services</h1>
+  <p>Local Git forge, FreeBSD mirror, and package build infrastructure.</p>
+
+  <main class="grid">
+    <a href="/ci/">
+      <strong>CI/CD Dashboard</strong>
+      <span>GateBSD builds, jobs, logs, releases</span>
+    </a>
+    <a href="https://git.example.lan/forgejo/">
+      <strong>Git Forge</strong>
+      <span>Repositories and source management</span>
+    </a>
+    <a href="/gatebsd/releases/current/">
+      <strong>Current GateBSD Release</strong>
+      <span>Signed package of the latest version</span>
+    </a>
+    <a href="/pub/FreeBSD/">
+      <strong>FreeBSD 15.1 amd64</strong>
+      <span>Local mirror of releases and snapshots</span>
+    </a>
+    <a href="/mirror-status/">
+      <strong>Mirror Status</strong>
+      <span>Latest sync and storage utilization</span>
+    </a>
+    <a href="/health/ready">
+      <strong>Readiness Probe</strong>
+      <span>End-to-end local mirror status</span>
+    </a>
+    <a href="/freebsd/git/src/">
+      <strong>FreeBSD src</strong>
+      <span>FreeBSD base source mirror</span>
+    </a>
+    <a href="/freebsd/git/ports/">
+      <strong>FreeBSD ports</strong>
+      <span>Ports collection mirror</span>
+    </a>
+    <a href="/freebsd/git/doc/">
+      <strong>FreeBSD doc</strong>
+      <span>Documentation mirror</span>
+    </a>
+    <a href="/freebsd/releases/">
+      <strong>FreeBSD releases</strong>
+      <span>Verified install media images</span>
+    </a>
+    <a href="/freebsd/distfiles/">
+      <strong>Distfiles</strong>
+      <span>Upstream source cache for poudriere</span>
+    </a>
+    <a href="/gatebsd/packages/">
+      <strong>Local Packages</strong>
+      <span>poudriere package repositories</span>
+    </a>
+    <a href="/poudriere/">
+      <strong>Poudriere</strong>
+      <span>Build monitor and logs</span>
+    </a>
+  </main>
+</body>
+</html>

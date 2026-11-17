@@ -1,0 +1,6 @@
+# Bare values are direct WAN exceptions. Use "vpn host" for the tunnel or
+# "default host" to leave the system default path unchanged.
+# These endpoints time out through the current VPN but answer through primary WAN.
+# Resolve them on every RU table update; Cloudflare Kimi endpoints stay in the tunnel.
+agent-gw.kimi.com
+kimi.com

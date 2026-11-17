@@ -1,0 +1,29 @@
+log:
+  level: info
+
+# Note: `runner.file` and `server.connections` are mutually exclusive in
+# forgejo-runner 12.x. Supplying both makes the daemon exit with
+# "server connection conflict ... only one config file can provide server
+# connections". Credentials are declared here rather than in
+# /var/lib/forgejo-runner/.runner so that they live in a root-owned 0640 file
+# the service account can read but not rewrite.
+runner:
+  capacity: 1
+  timeout: 3h
+  shutdown_timeout: 30s
+  labels:
+    - gatebsd-ci:host
+    - freebsd-dispatch:host
+
+cache:
+  enabled: false
+
+host:
+  workdir_parent: /var/lib/forgejo-runner/work
+
+server:
+  connections:
+    gatebsd:
+      url: https://git.example.lan/forgejo/
+      uuid: %%RUNNER_UUID%%
+      token: %%RUNNER_TOKEN%%

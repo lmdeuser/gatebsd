@@ -1,0 +1,214 @@
+name: GateBSD trusted CI
+
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: gatebsd-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The build host is named by its role in the pipeline, not by the model of the
+# machine that fills it. `n100-ci` and `n100_ci_config` are the names the runner
+# already carries, so these defaults change nothing -- they only stop the name
+# of one particular mini-PC from being spelled into four separate files.
+#
+# provision-keys.sh writes the alias and the config under exactly these names;
+# tests/test_build_host_naming.py fails if the two ever disagree, because the
+# failure mode otherwise is a pipeline that cannot reach the build host at all.
+env:
+  BUILD_HOST_ALIAS: n100-ci
+  BUILD_SSH_CONFIG: n100_ci_config
+
+jobs:
+  validate:
+    runs-on: freebsd-dispatch
+    timeout-minutes: 20
+    outputs:
+      version_moved: ${{ steps.version_gate.outputs.moved }}
+    steps:
+      # Checkout is done with plain git over SSH rather than actions/checkout.
+      #
+      # Two reasons. First, actions/checkout is fetched from data.forgejo.org at
+      # job start, which puts a third-party download on the critical path of a
+      # pipeline whose entire purpose is to be self-contained and trusted.
+      # Second, Forgejo is served under the /forgejo/ subpath and hands the
+      # runner a clone URL without that prefix, so actions/checkout fetches a
+      # 404 and every job fails at the checkout step.
+      #
+      # The deploy key is read-only and scoped to this repository.
+      - name: Checkout via local Forgejo over SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/forgejo_deploy -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/forgejo_known_hosts -o BatchMode=yes"
+          rm -rf "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE"
+          git init --quiet "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git remote add origin ssh://git@git.example.lan:2222/owner/gatebsd.git
+          git fetch --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach FETCH_HEAD
+          git --no-pager log --oneline -1
+
+      # Publishing is refused for a version that is already published, and that
+      # refusal is deliberate: `versions/<VERSION>` has to keep meaning one set
+      # of bytes. A commit that does not move VERSION therefore has nothing to
+      # publish, and running the publish job on it produces a red run whose
+      # only message is that the guard still works. The gate is decided here,
+      # where the tree is already checked out, rather than by teaching the
+      # build host to guess what a commit was for.
+      - name: Decide whether this commit moves VERSION
+        id: version_gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/forgejo_deploy -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/forgejo_known_hosts -o BatchMode=yes"
+          cd "$GITHUB_WORKSPACE"
+          # Against what the branch was BEFORE this push, not against the
+          # parent of its last commit.
+          #
+          # HEAD~1 was the comparison until 27 August 2026, and it is wrong for
+          # every push carrying more than one commit. Release 2.9.86 was pushed
+          # as eight commits with VERSION moved in the first of them: the gate
+          # looked at the last commit, saw VERSION untouched, skipped the
+          # publish job -- and the run went green. Nothing was published and
+          # nothing said so, which is the worst shape a delivery failure can
+          # take.
+          #
+          # github.event.before is the branch tip the push replaced, so it spans
+          # the whole push however many commits it carries.
+          before="${{ github.event.before }}"
+          moved=true
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            # A manual run is the recovery path for a release that is absent.
+            # Comparing only the last commit would skip it whenever that commit
+            # left VERSION unchanged -- including the executable-bit repair.
+            moved=true
+          elif [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            # workflow_dispatch has no `before`, and neither has the first push
+            # of a branch. The parent is the best available answer.
+            git fetch --quiet --depth 2 origin "$GITHUB_SHA" || true
+            if git rev-parse --quiet --verify HEAD~1 >/dev/null; then
+              if git diff --quiet HEAD~1 HEAD -- VERSION; then
+                moved=false
+              fi
+            fi
+          elif git fetch --quiet --depth 1 origin "$before" 2>/dev/null; then
+            if git diff --quiet "$before" HEAD -- VERSION; then
+              moved=false
+            fi
+          else
+            # `before` was named and cannot be fetched: history was rewritten
+            # under us, which is what a force-push does. Falling back to the
+            # parent here would reintroduce exactly the hole this gate was
+            # rewritten to close -- a multi-commit force-push whose last commit
+            # leaves VERSION alone would go green without publishing. Publish
+            # instead: the build host refuses a version that is already taken,
+            # so guessing wrong costs a red run rather than a lost release.
+            moved=true
+          fi
+          echo "moved=$moved" >> "$GITHUB_OUTPUT"
+          echo "VERSION $(cat VERSION), moved=$moved"
+
+          # A commit that does not move VERSION publishes nothing, and that is
+          # normal -- provided the version it carries is ALREADY published. If
+          # it is not, an earlier run was supposed to publish it and did not,
+          # and every run after that one goes green while the release does not
+          # exist. That is how 2.9.86 through 2.9.90 were lost: each failure was
+          # followed by a fix that did not move VERSION, so nothing tried again
+          # and nothing said so.
+          #
+          # Checked against the published tree over HTTP rather than by asking
+          # the build host, because that tree is what a device actually reads.
+          if [ "$moved" = false ]; then
+            version=$(cat VERSION)
+            if curl -fsS -o /dev/null --max-time 20 \
+                 "http://mirror.example.lan/gatebsd/releases/versions/$version/"; then
+              echo "VERSION $version is already published; nothing to do."
+            else
+              echo "VERSION $version moves nothing here and is NOT published." >&2
+              echo "An earlier run was meant to publish it and did not." >&2
+              echo "Re-run this workflow by hand (workflow_dispatch) to publish the same tree," >&2
+              echo "or move VERSION if the tree has changed since." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Validate scripts and Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          while IFS= read -r script; do
+            case "$(head -n 1 "$script")" in
+              *python*) python3 -m py_compile "$script" ;;
+              *sh) sh -n "$script" ;;
+            esac
+          done < <(find ci sbin rc.d infra -type f \( -name '*.sh' -o -name 'gatebsd-*' -o -name 'gatewayctl' -o -name 'ru-*' \) | sort)
+          python3 -m compileall -q webui/backend
+
+      - name: Unit tests
+        shell: bash
+        env:
+          PYTHONPATH: webui/backend
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Infrastructure health
+        shell: bash
+        run: ssh -F "$HOME/.ssh/$BUILD_SSH_CONFIG" "$BUILD_HOST_ALIAS" health
+
+      # Whether the stand still matches the repository, asked BEFORE a release
+      # is built rather than discovered afterwards.
+      #
+      # The build host runs the scripts DEPLOYED on it, not the ones in the
+      # commit being built: a fix to ci/host/ takes effect only after
+      # install-ci-host.sh has run there. Release 2.9.88 died on exactly that --
+      # the corrected path to the Forgejo repository was in the commit and the
+      # machine was still executing the previous copy, so the run failed on a
+      # line that the tree said was already fixed.
+      #
+      # The check is a MODE of gatebsd-ci-build rather than a second privileged
+      # helper: ci_deployer.sudoers grants exactly one path, and that boundary
+      # is worth more than the tidier name.
+      - name: Stand matches the repository
+        shell: bash
+        run: ssh -F "$HOME/.ssh/$BUILD_SSH_CONFIG" "$BUILD_HOST_ALIAS" ci-verify-deployment "$GITHUB_SHA"
+
+  freebsd-package:
+    # workflow_dispatch builds too, and that is not a convenience. Releases
+    # 2.9.64 through 2.9.67 failed for a reason that was not in the commit --
+    # the build host's base snapshot was one package short -- and with `push`
+    # as the only trigger there was no way to retry the same tree. This Forgejo
+    # has no rerun endpoint either: /actions/runs/{id}/rerun is 404. So every
+    # retry had to be a commit invented to carry nothing, which is how a history
+    # stops describing what happened.
+    #
+    # The ref guard is what keeps this safe: dispatching another branch runs
+    # validate and publishes nothing.
+    #
+    # A push also has to move VERSION. Everything else -- documentation,
+    # infrastructure, tests -- has nothing to publish, and used to fail here
+    # against the already-published guard. workflow_dispatch is exempt on
+    # purpose: that is the retry path for a release whose build failed for a
+    # reason outside the tree, and the guard on the build host still stands.
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.validate.outputs.version_moved == 'true'))
+    needs: validate
+    runs-on: freebsd-dispatch
+    timeout-minutes: 90
+    steps:
+      - name: Build, test, sign and publish on the build host
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The build host resolves the commit from its own Forgejo repository and
+          # refuses anything not reachable from master, so only the SHA needs to
+          # cross the trust boundary -- no workspace checkout is required here.
+          ssh -F "$HOME/.ssh/$BUILD_SSH_CONFIG" "$BUILD_HOST_ALIAS" ci-build "$GITHUB_SHA"

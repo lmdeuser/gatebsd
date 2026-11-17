@@ -1,0 +1,20 @@
+#!/bin/sh
+# PROVIDE: gatebsd_lock_cleanup
+# REQUIRE: FILESYSTEMS
+# BEFORE: NETWORKING
+
+. /etc/rc.subr
+
+name="gatebsd_lock_cleanup"
+rcvar="gatebsd_lock_cleanup_enable"
+desc="Remove boot-stale GateBSD PID and kernel-lock files"
+start_cmd="gatebsd_lock_cleanup_start"
+stop_cmd=":"
+
+gatebsd_lock_cleanup_start() {
+    /usr/local/sbin/gatebsd-lock-cleanup --boot
+}
+
+load_rc_config "$name"
+: ${gatebsd_lock_cleanup_enable:="YES"}
+run_rc_command "$1"

@@ -1,0 +1,10 @@
+# Primary (the gateway itself)
+# Generate hash: echo -n 'PASSWORD' | sha1
+[upsmon-master]
+    password = CHANGEME_1
+    upsmon primary
+
+# Network clients (secondary hosts)
+[upsmon-client]
+    password = CHANGEME_2
+    upsmon secondary
