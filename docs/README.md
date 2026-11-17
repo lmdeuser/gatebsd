@@ -3,6 +3,7 @@
 ## Operations & Guides
 
 - [User Guide](USER_GUIDE.md) — router traffic flows, subsystems, and administration.
+- [Technical Specification](SPECIFICATION.md) — full architecture, data flow, and why the VPN channel stays fast, loop-free, and reliable.
 - [Package Upgrade Runbook](ROUTER_UPGRADE.md) — pre-flight checks, `gatebsd-upgrade`, health gate, and rollback.
 - [Package Repositories](PKG_REPOSITORY.md) — package sources, key pinning, and trust boundary.
 

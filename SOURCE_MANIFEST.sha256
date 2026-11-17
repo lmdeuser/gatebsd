@@ -25,6 +25,7 @@
 13dd29b5433afff24b1df5aa78748e22a1c3cb69e1185802052f2915a05a324c  ./infra/freebsd-ci/install-poudriere-repo-route.sh
 15316ccaf904db2b27f40b74a1c020afbca7d6d3d0a8736a250c3d15a655a64a  ./etc/cron.d/gatebsd-healthcheck
 16b5b4643241fa37bdc18cd1e002cf166d9676bd362390f3553cc411439afd85  ./tests/test_ups_bootstrap.py
+187d765ac3275045fad99ecb2a28c8b1aa35654010e8d304b1827bdc01ea6b6a  ./docs/README.md
 1939d1b422fd25348f406a1370598b60d92ecd1441be43509adb6db73822e924  ./infra/forgejo/README.md
 19e1634fc1d809d312f51ba3d6fd85b0553c06b368259275a57994756b60fecb  ./etc/amnezia/direct-exceptions.conf.sample
 1a1795eb2edc0de67f835a6b42da442b2f8443d5dfe90ffec62df069c0920c6b  ./backup/README.md
@@ -87,7 +88,6 @@
 42bbf022a3af5ae3f6d6c3704bab78afcc18e49ee27e7e9a2fbd31500cdba0da  ./infra/freebsd-ci/bootstrap.sh
 4388e07786402b26de18576451317d846325b6e84be95f4ec5ca494647ec4476  ./infra/freebsd-ci/ports-overlay/lang/python312/pkg-plist
 4650c67f2e9114295e7725f5d56357f2514f317ef9640d005471f989ac1e20a5  ./webui/backend/gatebsd_ui/adapters/firewall.py
-46d0a86207757e0404bb4e546086f10b308c9b182625aba98af00dd527f473b2  ./docs/README.md
 484e566a02f2d07c3fa5001d2c7d75955c5bab132c871d9654f3c9c573991007  ./tests/test_pkg_upgrade.py
 49e6a76386584461a65e5a6fbcd72e1096569986eef07e77c8bca7c6a51a6335  ./tests/test_ssh_hardening.py
 4b5435a8c01c37ec31c303076b0174fd57663c49d3ec434feb289fd8833d97a9  ./sbin/gatebsd-install
@@ -123,7 +123,6 @@
 5f0e7ceaa21c81fd3f0fe9f3ed4cbe3f1e8b0dc9a5da7f0fc10699e66502de69  ./etc/cron.d/gatebsd-adblock
 5f844adb508a6a9a04d5ed7707a7411b3cab778fb62f30ca418b47c04f2abcb2  ./pkg/README.md
 60cef5e20ced4de3a503db701439a775db9df921ef8db81f62da63808a97c2a9  ./webui/backend/gatebsd_ui/command.py
-61539e6e4a2ba8d6f8e64b8b5c1ad0e87a2f17b6565d21f424b579f47418be8f  ./README.md
 61c0e56fa2bdfd9ad8184488f40c5490187cfb7b78d275de3b4a53a099fb3511  ./tests/test_operator_panel.py
 621fbf19fd0ed6012b2f8581bb8ca935cc851eed909a7d5ddaf9c291d3e52956  ./webui/backend/gatebsd_ui/writers/vpn.py
 639a8d2663a869842d96733926080a46e426f828c2f5a7630543312f3f499afa  ./etc/gatebsd/adblock-extra
@@ -181,6 +180,7 @@
 8a812a6895bef82cf7a62e3cdc725785b449c84a8d19e0c47e81aab9d846184e  ./docs/USER_GUIDE.md
 8a9bac9cafa5b274dfd0529cb4935ca173ae9f3338d8a84f14011a95b91ff483  ./tests/test_vpn_autostart.py
 8b95b3b1120572a6b2ec6cb695d883b35362a71fc759c7073baea99935f3919b  ./webui/backend/gatebsd_ui/vpn_policy.py
+8dda2b127d0686f1d9c0c287c090c5ffe2bbea0443f1b7e8f0a767b5c5481698  ./README.md
 8e9633a940961fb55c4bd379e30bcb4e70a023ae5db05fa539f5e7e35a2c930a  ./tests/test_mirror_readiness.py
 8fb15fb0b564fc0a569dd00a3214c7265e1e0d372ab47b32ca437901a543c1bc  ./tests/test_watchdog_wan_probe.py
 8ff2dfecc4ea659458611e8eabebaf99da00e6efaa25b551de40daca1f7c487f  ./tests/test_vpn_policy_editor.py
@@ -265,6 +265,7 @@ cb680f848ebc2fc284aa5c29ff94c654a59461e90744804d5266f30018d450e1  ./tests/test_l
 cba855cad5a58586abe0ee2a9e7c8ebe4c2631a5029a372cef9818ecb1f540df  ./tests/test_ups_backup.py
 cbcce0bec3939020e0258fc980a8a41a9ae4cf57f4ee653cb511dccdf5e37a7c  ./webui/backend/gatebsd_ui/writers/firewall.py
 cc81441e55c0c0d3e959d9d970aa50477f2c0b2ef37d387059d156e5776b910e  ./webui/frontend/xterm-addon-fit.js
+ccbdb03a66478d25084b24d8c5f381639cb3477f82627112a4f6a100faffc4bb  ./docs/SPECIFICATION.md
 cd15036a327d60840a62b0a4e184ee4fda7d03d15c035a8314cfccf66990ff27  ./infra/runner/README.md
 cd9486161536d5aa299ea7c500c533a0d38ece5158ff5899d32b190bafb9f9bf  ./tests/test_button_reports_the_world.py
 cdd801c5adb209a74a937652b71eb9203b9f02f73f4acaea92efad6842133f22  ./tests/test_frontend_version_stamp.py

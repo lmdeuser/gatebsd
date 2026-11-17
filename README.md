@@ -2,7 +2,7 @@
 
 GateBSD is a closed-loop FreeBSD network gateway appliance with a split-privilege architecture: an unprivileged Web UI, a root-privileged local socket agent, and specialized writers and supervisors for PF, AmneziaWG, Unbound DNS, ISC DHCP, multi-WAN failover, backups, and transactional package upgrades.
 
-Documentation index: [docs/README.md](docs/README.md) · [User Guide](docs/USER_GUIDE.md)
+Documentation index: [docs/README.md](docs/README.md) · [Specification](docs/SPECIFICATION.md) · [User Guide](docs/USER_GUIDE.md)
 
 ## Design Contract
 
