@@ -180,7 +180,6 @@
 8a812a6895bef82cf7a62e3cdc725785b449c84a8d19e0c47e81aab9d846184e  ./docs/USER_GUIDE.md
 8a9bac9cafa5b274dfd0529cb4935ca173ae9f3338d8a84f14011a95b91ff483  ./tests/test_vpn_autostart.py
 8b95b3b1120572a6b2ec6cb695d883b35362a71fc759c7073baea99935f3919b  ./webui/backend/gatebsd_ui/vpn_policy.py
-8dda2b127d0686f1d9c0c287c090c5ffe2bbea0443f1b7e8f0a767b5c5481698  ./README.md
 8e9633a940961fb55c4bd379e30bcb4e70a023ae5db05fa539f5e7e35a2c930a  ./tests/test_mirror_readiness.py
 8fb15fb0b564fc0a569dd00a3214c7265e1e0d372ab47b32ca437901a543c1bc  ./tests/test_watchdog_wan_probe.py
 8ff2dfecc4ea659458611e8eabebaf99da00e6efaa25b551de40daca1f7c487f  ./tests/test_vpn_policy_editor.py
@@ -216,6 +215,7 @@ a33e368bf7571c23db77898bd546762799b002a74b864b84f9b2a26f4d52875b  ./tests/test_n
 a4e207e6bc31faf33747f651c4a432bf35dee63d39228521e89e983b43029246  ./tests/test_port_forward.py
 a54d5fbf4cb10bc3576de7f531188803241fa8b6134714cfbaf5b22c821b1f05  ./webui/backend/gatebsd_ui/tls.py
 a5cca04fc6ce4f580251872400edbdbbc14d29e89e18369ea9c792433f70a07a  ./sbin/gatebsd-backup.sh
+a5f87e3bc10ea284f23317f9c48fbf9d1fcda8865e6b1f7796e213ae18fca404  ./README.md
 a630a15e02db1428b1ee76fda1a476a4f398098bd8ac638df10a8913275c73ac  ./scripts/install-loader-conf.sh
 a75de106b63e10e909a8171b1bb21dccc89edae92f9f51e22803925a7393acbf  ./scripts/build-source-archive.sh
 a75e079569caf576be364e6f262df29cbc6c38cea742cbaa9a64cc24aa773c0e  ./infra/freebsd-ci/README.md

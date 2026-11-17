@@ -1,82 +1,83 @@
 # GateBSD
 
-GateBSD is a closed-loop FreeBSD network gateway appliance with a split-privilege architecture: an unprivileged Web UI, a root-privileged local socket agent, and specialized writers and supervisors for PF, AmneziaWG, Unbound DNS, ISC DHCP, multi-WAN failover, backups, and transactional package upgrades.
+GateBSD is software for [FreeBSD](https://www.freebsd.org/) (a set of shell scripts, service configurations, and a Python web interface) that turns a FreeBSD computer with two network ports into an Internet [gateway](https://en.wikipedia.org/wiki/Default_gateway) for your [local area network (LAN)](https://en.wikipedia.org/wiki/Local_area_network).
 
-Documentation index: [docs/README.md](docs/README.md) · [Specification](docs/SPECIFICATION.md) · [User Guide](docs/USER_GUIDE.md)
+You connect one network port to your ISP cable or modem ([WAN](https://en.wikipedia.org/wiki/Wide_area_network)) and the other port to your local switch or Wi-Fi access point. Once set up, devices on your LAN (laptops, phones, TVs) do not need local VPN apps: outbound traffic goes through the gateway's VPN tunnel by default, while regional IPs, chosen domains, and their DNS queries go directly over the ISP link via [split tunneling](https://en.wikipedia.org/wiki/Split_tunneling).
 
-## Design Contract
+## What it does
 
-GateBSD is built around dual-path delivery:
+- **Gateway VPN and bypass rules**: Connects to [WireGuard](https://www.wireguard.com/) or [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) servers and sends traffic through the tunnel by default, while routing a regional prefix table and your per-domain/IP exceptions straight out the WAN interface.
+- **Local DNS, ad filtering, and Split-DNS**: Runs [Unbound](https://nlnetlabs.nl/projects/unbound/about/) for local [DNS](https://en.wikipedia.org/wiki/Domain_Name_System) resolution, blocks ad domains at the DNS layer, and forwards selected domains to direct resolvers ([split-horizon DNS](https://en.wikipedia.org/wiki/Split-horizon_DNS)) while keeping the rest of DNS behind the VPN.
+- **Backup Internet failover**: Monitors the primary connection (Ethernet or [PPPoE](https://en.wikipedia.org/wiki/Point-to-Point_Protocol_over_Ethernet) via `mpd5`) and switches to a secondary link (such as a USB LTE modem) using separate FreeBSD routing tables ([setfib(1)](https://man.freebsd.org/cgi/man.cgi?query=setfib)), then switches back when the primary line recovers.
+- **Firewall, NAT, and DHCP**: Manages FreeBSD's [PF](https://man.freebsd.org/cgi/man.cgi?query=pf) firewall, [NAT](https://en.wikipedia.org/wiki/Network_address_translation), WAN-to-LAN port forwarding, and [ISC DHCP](https://www.isc.org/dhcp/) from the browser.
+- **Config checks and rollback**: Validates PF, Unbound, and DHCP files before reloading services, reverts firewall edits after 120 seconds if you do not confirm them in the UI, and snapshots configs before changes or package updates.
+- **UPS shutdown**: Optionally monitors a battery backup with [NUT](https://networkupstools.org/) and shuts FreeBSD down before power runs out.
 
-1. Bare-metal installation from an image and package repository bootstrap.
-2. In-field upgrades via signed `.pkg` archives.
+## Requirements
 
-Both paths must converge on identical device state (file contents, ownership, and permissions) for any given `VERSION`.
+- An `amd64` computer or virtual machine running **FreeBSD** (tested on `15.1-RELEASE`) with at least two network interfaces (`WAN` and `LAN`), basic FreeBSD IP networking configured, and `root` access.
+- FreeBSD packages (there are no `pip` or `npm` dependencies):
 
-Key structural invariants verified by the test suite:
+```sh
+pkg install python312 py312-sqlite3 amnezia-kmod amnezia-tools amneziawg-go \
+    unbound isc-dhcp44-server mpd5 nginx sudo acme.sh rsync ca_root_nss nut smartmontools
+```
 
-- **One managed file, one writer**: Configuration and deployment targets have a single canonical writer (`tests/test_one_writer_per_managed_file.py`).
-- **Dormant configuration defense**: `sbin/gatebsd-config-guard` runs native validators (`pfctl -nf`, `dhcpd -q -t -cf`, `unbound-checkconf`, `nginx -t -c`) before service restarts so broken files on disk cannot remain masked by valid in-memory state.
-- **Defect-reintroduction testing**: Regression tests execute real scripts in sandboxed temporary roots and reintroduce historical defects to verify detection (`tests/test_ci_build_detach.py`, `tests/test_release_integrity.py`).
-- **Source provenance**: `SOURCE_MANIFEST.sha256` binds every tracked file via SHA-256 and refuses unstaged edits (`scripts/build-source-manifest.sh`).
+*(You can skip `mpd5`, `acme.sh`, or `nut` if you do not use PPPoE, automated TLS certificates, or a UPS.)*
 
-## Privilege Separation
+## How to install and use
 
-- The Web UI runs under the dedicated unprivileged account `gatebsd` (`/usr/sbin/nologin`).
-- The privileged agent listens on `/var/run/gatebsd/agent.sock` (`root:gatebsd`, mode `0660`) and enforces `AGENT_ALLOWED_GET` / `AGENT_ALLOWED_POST` route allowlists.
-- By default the Web UI binds only to `127.0.0.1:8080` behind `nginx`.
-- In `system` auth mode, login is restricted to `root` or members of `wheel` (configurable via `gatebsd_admin_group`). Unprivileged local users do not receive root API access.
-- Authentication is mandatory and fails closed. Mutating POST endpoints require same-origin JSON requests; session tokens are HMAC-signed with epoch and persistent revocation support.
-- SSH accepts public keys only (`AllowGroups wheel gatebsd-agent`). Legacy global `AllowUsers` directives in `/etc/ssh/sshd_config` are retired safely by `gatebsd-config-migrate` while preserving `Match` blocks.
-- Automated maintenance uses `gatebsd-agent` without an arbitrary root shell: `sudo` permits only `/usr/local/sbin/gatebsd-agentctl` with allowlisted actions (`service-status`, `disk-usage`, inactive `be-destroy`, `image-backup-prune`, `pkg-fetch` cache pruning, and `gatebsd-upgrade`).
+### 1. Install GateBSD onto your FreeBSD host
 
-## Subsystems
+`gatebsd-install` keeps your existing FreeBSD network configuration untouched (`--existing` mode), backs up `/etc/pf.conf`, `rc.conf`, `unbound.conf`, and `dhcpd.conf` under `/var/backups/gatebsd/`, and enables the system services.
 
-### AmneziaWG & Split Tunneling
+Run as `root`:
 
-Peer operations (`peer add`, `peer remove`, `key rotate`) live in `webui/backend/gatebsd_ui/writers/vpn.py`. They invoke `awg`, validate keys and duplicates, acquire inter-process locks, create backups, and publish configurations atomically while preserving existing line endings, ownership, and file modes.
+```sh
+git clone https://github.com/lmdeuser/gatebsd.git
+cd gatebsd
+make install
+/usr/local/sbin/gatebsd-install --existing --enable --start
+```
 
-Persistent routing exceptions are stored in `/usr/local/etc/amnezia/direct-exceptions.conf` and `/usr/local/etc/amnezia/vpn_override.table` with IDNA/Punycode normalization and shared Cloudflare CDN IPv4 overlap warnings for `direct` rules. Scheduled route updates merge operator exceptions via `gatebsd_ui.vpn_policy merge`.
+If you are configuring `pf`, `unbound`, `nginx`, or `gateway.conf` for the first time, sample templates are included at [etc/pf.conf.sample](etc/pf.conf.sample), [etc/amnezia/gateway.conf.sample](etc/amnezia/gateway.conf.sample), [etc/unbound/unbound.conf.sample](etc/unbound/unbound.conf.sample), [etc/nginx/gatebsd.conf.sample](etc/nginx/gatebsd.conf.sample), and [etc/gatebsd/failover.conf.sample](etc/gatebsd/failover.conf.sample). When using the sample [nginx](https://nginx.org/) config, place a TLS certificate and key at `/usr/local/etc/gatebsd/tls/cert.pem` and `/usr/local/etc/gatebsd/tls/key.pem`.
 
-### PF, DHCP, and Unbound DNS
+### 2. Log in to the web panel
 
-Writers validate candidate configurations with native FreeBSD tools, hold exclusive locks across the full read-modify-apply-publish cycle, stage writes on the destination filesystem with `O_NOFOLLOW` and `fsync`, and roll back on runtime failures. Firewall commits run a static LAN lockout check (`check_management_access`) and auto-revert after `PF_CONFIRM_TIMEOUT = 120` seconds if unconfirmed. Targeted split-DNS overrides reside in `/usr/local/etc/gatebsd/split-dns.conf`.
+By default `nginx` serves HTTPS on port `443` and proxies to the Python backend (`127.0.0.1:8080`). Open `https://<your-gateway-lan-ip>/` in a browser and sign in with `root` or any account in the FreeBSD `wheel` group. To use a dedicated panel password instead of system login, adjust `gatebsd_auth_mode` in [etc/gatebsd.conf](etc/gatebsd.conf) and set a password with `/usr/local/sbin/gatebsd-passwd`.
 
-### Multi-WAN Failover, VPN, and Policy Routes
+### 3. Add a VPN config and set bypass rules
 
-`gatebsd-watchdog.sh`, `gatewayctl`, `gatebsd-route-op`, and `ru-routes.sh` serialize route transitions on a shared route lock. Default route switches, VPN endpoint pinning, and policy route updates run as snapshot-and-rollback transactions; `gatebsd-route-op` caches the last resolved VPN endpoint IP in `/var/db/gatebsd-system/awg-endpoint.cache` for DNS-free cold starts. Large policy route tables load asynchronously under `daemon(8)` so boot and emergency failover are never blocked.
+1. Open the **Amnezia VPN** tab and upload a `.conf` file for WireGuard or AmneziaWG. GateBSD sets `Table = off` and removes `DNS =` lines so its own route helper and `unbound` keep control over the default route and local DNS.
+2. Start the tunnel. GateBSD uses the FreeBSD kernel module (`amnezia-kmod`) by default and automatically selects userspace (`amneziawg-go`) when obfuscation headers `H1..H4 <= 4` require it.
+3. Open **Routing Policy** to route specific domains or IPv4 subnets directly over WAN (or force them through VPN). Open **Targeted Split-DNS** to forward specific domains to chosen direct DNS resolvers while leaving everything else on the VPN upstream.
+4. Open **Failover** to verify primary and backup link checks in `observe` mode before switching to `automatic`.
 
-### Adblock & TLS
+## How the code is organized
 
-`gatebsd-adblock-update.sh` bounds payload size, parses host entries strictly, validates via `unbound-checkconf`, publishes atomically, and restores the previous working blocklist if reload fails.
+- **No third-party libraries**: The web backend uses Python's standard library (`http.server`, `sqlite3`, `fcntl`), and the frontend is static HTML, CSS, and JavaScript.
+- **Separated privileges**: The web UI runs as the unprivileged `gatebsd` user and sends allowlisted requests over `/var/run/gatebsd/agent.sock` to a root agent and root shell helpers (`sbin/gatewayctl`, `sbin/gatebsd-route-op`, `sbin/gatebsd-watchdog.sh`).
+- **One writer per managed file**: Each system config has a single canonical writer (`tests/test_one_writer_per_managed_file.py`), and `SOURCE_MANIFEST.sha256` records SHA-256 digests of tracked files (`scripts/build-source-manifest.sh`).
 
-`gatebsd-renew-ssl` checks TLS certificates within a 30-day renewal window using DNS-01 ACME (`acme.sh`), validates candidate hostname, expiry, and key match, and rolls back on `nginx` reload errors. Nginx caps request bodies at 1 MiB and rate-limits API traffic.
+Further reading:
 
-### Backups & Transactional Upgrades
+- [User Guide](docs/USER_GUIDE.md) — subsystem overview, failover modes, port forwarding, and DNS behavior.
+- [Technical Specification](docs/SPECIFICATION.md) — internal traffic flow, MTU/MSS sizing, anti-loop endpoint pinning, and watchdog details.
+- [Package Upgrade Runbook](docs/ROUTER_UPGRADE.md) — `.pkg` upgrade workflow and rollback mechanics.
+- [Documentation Index](docs/README.md)
 
-1. **Configuration snapshots** (`webui/backend/gatebsd_ui/backup.py`): staged atomically under `/var/backups/gatebsd` (`0700`) with a 16 MiB per-file limit, 64 MiB aggregate limit, and bounded retention (`10` copies / `512 MiB`), redacting secrets in diffs.
-2. **Full ZFS boot-environment images** (`sbin/gatebsd-backup.sh`): streams compressed ZFS snapshots without stopping routing, enforces a `10 GiB` reserve, verifies `gzip -t` and `zstreamdump`, and prunes to `GATEBSD_IMAGE_BACKUP_KEEP=1` by default. `backup/gatebsd-restore.sh` validates archives and streams before prompting for destructive disk operations.
-3. **Package upgrades** (`sbin/gatebsd-upgrade`): copies root-owned `.pkg` files to private staging, checks SHA-256 stability, cross-checks metadata via both `pkg info -F` and `pkg query -F`, requires `GATEBSD_UPGRADE_MIN_FREE_KIB` (`1 GiB` reserve), snapshots rollback artifacts, restarts only previously active services, runs a full health gate, and rolls back package, config, and SQLite state on any failure.
+## Running tests
 
-## Zero-Dependency Runtime
-
-- **Backend**: Python standard library only (`http.server`, `sqlite3`, `fcntl`, `socketserver`). No `pip` packages.
-- **Frontend**: Static HTML, CSS, and vanilla JavaScript with vendored `xterm.js` and `lucide.min.js`. No Node/npm build pipeline.
-- **Python resolution**: `ci/resolve-python.sh` detects the installed FreeBSD Python interpreter and emits `/usr/local/libexec/gatebsd-python`; `ci/verify-python-tree.sh` checks source-to-stage `.py` parity and `gatebsd_ui.integrity` verifies imports across all modules including the `11` critical split modules.
-
-## Verification
-
-Run the cross-platform syntax, integrity, and unit test checks locally:
+Run the unit and sandbox test suite locally (Linux, macOS, or FreeBSD):
 
 ```sh
 PYTHONPATH=webui/backend python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
-Tests requiring live FreeBSD kernel features (`pf`, `setfib`, `rc.d`, `pkg`, `ZFS`) are automatically skipped on Linux and executed on the FreeBSD build stand.
+Tests that depend on live FreeBSD kernel tools (`pf`, `setfib`, `rc.d`, `pkg`, ZFS) skip automatically on Linux and run on the FreeBSD build host.
 
-## Limitations
+## Status and license
 
-- Full package builds, `rc.d` integration, ZFS image restore, UPS monitoring, and live `pf`/`setfib` routing require a FreeBSD environment.
-- Local SHA-256 verification during `gatebsd-upgrade` protects against TOCTOU swaps; cryptographic origin trust depends on `pkg(8)` repository signing (`gatebsd-stand.pub`).
-- Third-party dependency packages installed prior to an upgrade are not automatically removed during rollback because other packages may share them.
-- GateBSD does not manage Secure Boot enrollment, EFI keys, firmware updates, or PXE boot.
+This is working personal software used on a live gateway, not a polished commercial product — it still contains bugs and rough edges. Test it on a spare machine or VM before using it as your primary network gateway.
+
+Released under the [BSD 2-Clause License](LICENSE).
